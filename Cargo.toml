@@ -1,0 +1,23 @@
+[package]
+name = "amaterasu-rtx-hdr"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+[lib]
+crate-type = ["cdylib", "rlib"]
+[features]
+linux-nvidia = []
+[dependencies]
+amaterasu-module-sdk.workspace = true
+amaterasu-media.workspace = true
+amaterasu-configuration-schema.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+[target.'cfg(target_os = "linux")'.dependencies]
+amaterasu-rtx-runtime = { path = "../../crates/rtx-runtime" }
+libc = "0.2"
+[build-dependencies]
+cc = "1"
+pkg-config = "0.3"
+[lints]
+workspace = true
