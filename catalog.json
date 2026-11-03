@@ -1,0 +1,1 @@
+{"schema":1,"repository":"amaterasu-rtx-hdr","sequence":1,"expires_unix":1801461733,"target":"linux-x86_64","candidates":[{"slot":"amaterasu.rtx-hdr","implementation":"amaterasu-linux-session-rtx-hdr","version":"0.1.0","kind":"native_set","manifest_sha256":"ae3cd806739de6e6856fe0d55567810b5bb0bdd53c24b990e081b5db1d1781ff"}]}
