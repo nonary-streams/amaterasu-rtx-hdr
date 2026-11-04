@@ -7,11 +7,14 @@ use amaterasu_module_sdk::{
 use serde_json::{Value, json};
 use std::{
     collections::VecDeque,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-const POLL_INTERVAL: Duration = Duration::from_millis(200);
+const POLL_INTERVAL: Duration = Duration::from_millis(500);
 const MAX_PENDING: usize = 16;
 
 enum Stage {
@@ -33,10 +36,12 @@ struct Pending {
     payload: Value,
     operation_id: String,
     deadline: Instant,
+    started: Instant,
     stage: Stage,
 }
 pub(crate) struct Coordinator {
     policy: Arc<Mutex<ForegroundPolicy>>,
+    demand: Arc<AtomicUsize>,
     service: String,
     pending: VecDeque<Pending>,
     next_poll: Instant,
@@ -44,9 +49,14 @@ pub(crate) struct Coordinator {
     nonce: u128,
 }
 impl Coordinator {
-    pub(crate) fn new(policy: Arc<Mutex<ForegroundPolicy>>, service: String) -> Self {
+    pub(crate) fn new(
+        policy: Arc<Mutex<ForegroundPolicy>>,
+        demand: Arc<AtomicUsize>,
+        service: String,
+    ) -> Self {
         Self {
             policy,
+            demand,
             service,
             pending: VecDeque::new(),
             next_poll: Instant::now(),
@@ -96,6 +106,7 @@ impl Coordinator {
             payload,
             operation_id,
             deadline,
+            started: Instant::now(),
             stage: Stage::Submit,
         });
         true
@@ -110,7 +121,13 @@ impl Coordinator {
     }
     pub(crate) fn advance(&mut self, runtime: &RuntimeClient) {
         let now = Instant::now();
-        if now >= self.next_poll
+        if self.demand.load(Ordering::Relaxed) == 0
+            && let Ok(mut state) = self.policy.lock()
+        {
+            state.observe(None, now);
+        }
+        if self.demand.load(Ordering::Relaxed) > 0
+            && now >= self.next_poll
             && self.pending.len() < MAX_PENDING
             && !self
                 .pending
@@ -123,7 +140,8 @@ impl Coordinator {
                 service: self.service.clone(),
                 payload: json!({"action":"snapshot"}),
                 operation_id,
-                deadline: now + Duration::from_millis(500),
+                deadline: now + Duration::from_millis(1000),
+                started: now,
                 stage: Stage::Submit,
             });
             self.next_poll = now + POLL_INTERVAL;
@@ -136,7 +154,7 @@ impl Coordinator {
                 runtime.send(Command::CheckRequest { request: *inbound }),
                 Ok(Response::Error { .. })
             ),
-            Purpose::Observation => false,
+            Purpose::Observation => self.demand.load(Ordering::Relaxed) == 0,
         };
         if now >= pending.deadline || abandoned {
             if let Stage::Wait(id) | Stage::Release(id, _) = pending.stage {
@@ -190,7 +208,7 @@ impl Coordinator {
             Stage::Release(id, ref payload) => {
                 match runtime.send(Command::ReleaseResult { request: id }) {
                     Ok(Response::Ok) | Ok(Response::Error { .. }) => {
-                        self.finish(pending.purpose, payload.clone(), runtime, now);
+                        self.finish(pending.purpose, payload.clone(), runtime, pending.started);
                         return;
                     }
                     _ => (),
@@ -202,6 +220,9 @@ impl Coordinator {
     fn fail(&self, pending: Pending, runtime: &RuntimeClient, now: Instant) {
         match pending.purpose {
             Purpose::Observation => {
+                if self.demand.load(Ordering::Relaxed) == 0 {
+                    return;
+                }
                 if let Ok(mut state) = self.policy.lock() {
                     state.observe(None, now);
                 }

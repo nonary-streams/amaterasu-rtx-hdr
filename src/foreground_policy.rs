@@ -4,7 +4,7 @@ use amaterasu_module_sdk::extension_api::{LifecycleTarget, ProviderContext};
 use std::time::{Duration, Instant};
 
 const MAX_TARGETS: usize = 16;
-const MAX_OBSERVATION_AGE: Duration = Duration::from_millis(750);
+const MAX_OBSERVATION_AGE: Duration = Duration::from_millis(1500);
 
 #[derive(Default)]
 pub(crate) struct ForegroundPolicy {
@@ -98,7 +98,7 @@ mod tests {
         policy.observe(Some("/games/one"), now);
         assert!(policy.enabled(&target("one"), now));
         assert!(!policy.enabled(&target("two"), now));
-        assert!(!policy.enabled(&target("one"), now + Duration::from_secs(1)));
+        assert!(!policy.enabled(&target("one"), now + Duration::from_secs(2)));
         policy.observe(None, now);
         assert!(!policy.enabled(&target("one"), now));
         policy.set_context(&context(

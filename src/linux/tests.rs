@@ -28,6 +28,102 @@ fn frame() -> DmaBufFrame {
     }
 }
 
+fn intent_settings() -> (serde_json::Value, serde_json::Value) {
+    let mut settings = serde_json::to_value(
+        amaterasu_configuration_schema::defaults(&crate::settings_descriptor::definitions())
+            .unwrap(),
+    )
+    .unwrap();
+    settings["rtx_hdr_enable"] = true.into();
+    settings["rtx_hdr_peak_brightness"] = 1000.into();
+    let target = serde_json::json!({"kind":"stream","host_epoch":"epoch","session_id":"session","stream_id":"stream","generation":1});
+    let request = serde_json::json!({"method":"processing_intent","interface_major":1,"interface_minor":0,"arguments":{"target":target,"revision":"snapshot","settings":settings}});
+    let response = crate::lifecycle::intent("consumer", &["consumer".into()], request);
+    assert_eq!(response["status"], "succeeded");
+    (response["processor_settings"].clone(), settings)
+}
+
+#[test]
+fn intent_target_survives_registry_updates_and_demand_is_retired() {
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let counter = Arc::new(AtomicUsize::new(0));
+    let policy = Arc::new(Mutex::new(
+        crate::foreground_policy::ForegroundPolicy::default(),
+    ));
+    let (initial, mut registry) = intent_settings();
+    let mut processor = Processor::new(settings()).with_policy(policy, counter.clone());
+    processor
+        .configure_stream(9, &serde_json::to_vec(&initial).unwrap())
+        .unwrap();
+    let target = processor.targets[&9].clone();
+    registry["rtx_hdr_foreground_only"] = true.into();
+    registry["rtx_hdr_peak_brightness"] = 1800.into();
+    processor
+        .update_stream(9, &serde_json::to_vec(&registry).unwrap())
+        .unwrap();
+    assert_eq!(processor.targets[&9], target);
+    assert_eq!(processor.stream_settings[&9].peak_luminance, 1800);
+    assert_eq!(counter.load(Ordering::Relaxed), 1);
+    let mut changed = registry.clone();
+    changed["foreground_target"] = serde_json::Value::Null;
+    assert_eq!(
+        processor.update_stream(9, &serde_json::to_vec(&changed).unwrap()),
+        Err(STATUS_INVALID_ARGUMENT)
+    );
+    assert_eq!(counter.load(Ordering::Relaxed), 1);
+    registry["rtx_hdr_foreground_only"] = false.into();
+    processor
+        .update_stream(9, &serde_json::to_vec(&registry).unwrap())
+        .unwrap();
+    assert_eq!(counter.load(Ordering::Relaxed), 0);
+    registry["rtx_hdr_foreground_only"] = true.into();
+    processor
+        .update_stream(9, &serde_json::to_vec(&registry).unwrap())
+        .unwrap();
+    processor.cancel(9);
+    assert_eq!(counter.load(Ordering::Relaxed), 0);
+    processor
+        .configure_stream(10, &serde_json::to_vec(&initial).unwrap())
+        .unwrap();
+    processor
+        .update_stream(10, &serde_json::to_vec(&registry).unwrap())
+        .unwrap();
+    drop(processor);
+    assert_eq!(counter.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn foreground_demand_counts_each_stream_and_clears_on_shutdown() {
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let counter = Arc::new(AtomicUsize::new(0));
+    let policy = Arc::new(Mutex::new(
+        crate::foreground_policy::ForegroundPolicy::default(),
+    ));
+    let (mut initial, _) = intent_settings();
+    initial["rtx_hdr_foreground_only"] = true.into();
+    let mut startup = settings();
+    startup.max_streams = 2;
+    let mut processor = Processor::new(startup).with_policy(policy, counter.clone());
+    let payload = serde_json::to_vec(&initial).unwrap();
+    processor.configure_stream(1, &payload).unwrap();
+    processor.configure_stream(2, &payload).unwrap();
+    assert_eq!(counter.load(Ordering::Relaxed), 2);
+    processor.cancel(1);
+    assert_eq!(counter.load(Ordering::Relaxed), 1);
+    processor.cancel(1);
+    assert_eq!(counter.load(Ordering::Relaxed), 1);
+    processor.shutdown();
+    assert_eq!(counter.load(Ordering::Relaxed), 0);
+    drop(processor);
+    assert_eq!(counter.load(Ordering::Relaxed), 0);
+}
+
 #[test]
 fn unsupported_input_is_rejected_before_loading_vendor_code() {
     let mut processor = Processor::new(settings());
@@ -196,6 +292,10 @@ fn nvidia_live_tuning_preserves_held_frames_and_calibrates_fallback() {
     let session = stream.slots[0].session.clone();
     let source = Source::new(session.clone());
     let mut processor = Processor::new(config.clone());
+    let (initial_controls, _) = intent_settings();
+    processor
+        .configure_stream(77, &serde_json::to_vec(&initial_controls).unwrap())
+        .unwrap();
     processor.streams.insert(77, stream);
     let raw = into_gpu_binding(processor);
     let api = unsafe { &*raw };

@@ -133,13 +133,15 @@ impl ManagedModule for RtxHdr {
             let policy = std::sync::Arc::new(std::sync::Mutex::new(
                 foreground_policy::ForegroundPolicy::default(),
             ));
+            let demand = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let processor_demand = demand.clone();
             let processor_policy = policy.clone();
             let foreground = foreground_service
-                .map(|service| foreground_coordinator::Coordinator::new(policy, service));
+                .map(|service| foreground_coordinator::Coordinator::new(policy, demand, service));
             let create: CreateProcessor = Box::new(move |_principal| {
                 Ok(linux::Processor::new(settings.clone())
                     .with_logger(logger.clone())
-                    .with_policy(processor_policy.clone()))
+                    .with_policy(processor_policy.clone(), processor_demand.clone()))
             });
             let factory = amaterasu_module_sdk::processing::GpuProcessorFactory::new(create);
             if registry_principal.is_some() {

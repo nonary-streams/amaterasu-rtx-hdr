@@ -287,6 +287,8 @@ pub(crate) struct Processor {
     stream_settings: BTreeMap<u64, Settings>,
     targets: BTreeMap<u64, Option<amaterasu_module_sdk::extension_api::LifecycleTarget>>,
     policy: Option<std::sync::Arc<std::sync::Mutex<crate::foreground_policy::ForegroundPolicy>>>,
+    demand: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+    demanded: BTreeSet<u64>,
     streams: BTreeMap<u64, Stream>,
     retired: BTreeSet<u64>,
     logger: Option<amaterasu_module_sdk::LogEmitter>,
@@ -298,6 +300,8 @@ impl Processor {
             stream_settings: BTreeMap::new(),
             targets: BTreeMap::new(),
             policy: None,
+            demand: None,
+            demanded: BTreeSet::new(),
             streams: BTreeMap::new(),
             retired: BTreeSet::new(),
             logger: None,
@@ -306,13 +310,42 @@ impl Processor {
     pub fn with_policy(
         mut self,
         policy: std::sync::Arc<std::sync::Mutex<crate::foreground_policy::ForegroundPolicy>>,
+        demand: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     ) -> Self {
         self.policy = Some(policy);
+        self.demand = Some(demand);
         self
+    }
+    fn set_demand(&mut self, stream: u64, wanted: bool) {
+        let changed = if wanted {
+            self.demanded.insert(stream)
+        } else {
+            self.demanded.remove(&stream)
+        };
+        if changed && let Some(counter) = &self.demand {
+            if wanted {
+                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+    fn clear_demand(&mut self) {
+        for stream in std::mem::take(&mut self.demanded) {
+            if let Some(counter) = &self.demand {
+                counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            let _ = stream;
+        }
     }
     pub fn with_logger(mut self, logger: amaterasu_module_sdk::LogEmitter) -> Self {
         self.logger = Some(logger);
         self
+    }
+}
+impl Drop for Processor {
+    fn drop(&mut self) {
+        self.clear_demand();
     }
 }
 impl GpuFrameProcessor for Processor {
@@ -332,6 +365,7 @@ impl GpuFrameProcessor for Processor {
             .apply(&self.settings)
             .map_err(|_| STATUS_INVALID_ARGUMENT)?;
         self.targets.insert(stream, controls.foreground_target);
+        self.set_demand(stream, settings.foreground_only);
         self.stream_settings.insert(stream, settings);
         Ok(())
     }
@@ -342,17 +376,23 @@ impl GpuFrameProcessor for Processor {
         if !self.stream_settings.contains_key(&stream) && !self.streams.contains_key(&stream) {
             return Err(STATUS_INVALID_ARGUMENT);
         }
-        let controls: crate::settings::StreamSettings =
+        let value: serde_json::Value =
             serde_json::from_slice(json).map_err(|_| STATUS_INVALID_ARGUMENT)?;
+        let target_supplied = value.get("foreground_target").is_some();
+        let controls: crate::settings::StreamSettings =
+            serde_json::from_value(value).map_err(|_| STATUS_INVALID_ARGUMENT)?;
         let settings = controls
             .apply(&self.settings)
             .map_err(|_| STATUS_INVALID_ARGUMENT)?;
-        if self.targets.get(&stream).cloned().flatten() != controls.foreground_target {
+        if target_supplied
+            && self.targets.get(&stream).cloned().flatten() != controls.foreground_target
+        {
             return Err(STATUS_INVALID_ARGUMENT);
         }
         if let Some(active) = self.streams.get(&stream) {
             active.configure(&settings, active.enabled, self.logger.as_ref())?;
         }
+        self.set_demand(stream, settings.foreground_only);
         self.stream_settings.insert(stream, settings);
         Ok(())
     }
@@ -378,6 +418,9 @@ impl GpuFrameProcessor for Processor {
                 )?,
             );
         }
+        if !self.stream_settings.contains_key(&stream) {
+            self.set_demand(stream, self.settings.foreground_only);
+        }
         let settings = self.stream_settings.get(&stream).unwrap_or(&self.settings);
         let enabled = !settings.foreground_only
             || self.policy.as_ref().is_some_and(|policy| {
@@ -399,6 +442,7 @@ impl GpuFrameProcessor for Processor {
         active.process(frame, self.logger.as_ref())
     }
     fn cancel(&mut self, stream: u64) {
+        self.set_demand(stream, false);
         self.stream_settings.remove(&stream);
         self.targets.remove(&stream);
         if let Some(active) = self.streams.remove(&stream) {
@@ -413,6 +457,7 @@ impl GpuFrameProcessor for Processor {
             stream.assert_retired();
         }
         self.streams.clear();
+        self.clear_demand();
         self.stream_settings.clear();
         self.targets.clear();
     }
