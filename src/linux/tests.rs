@@ -1,6 +1,6 @@
 use super::*;
 use amaterasu_module_sdk::processing::{
-    ProcessingOutcome, configure_gpu_stream, into_gpu_binding, process_gpu,
+    ProcessingOutcome, configure_gpu_stream, into_gpu_binding, process_gpu, update_gpu_stream,
 };
 
 fn settings() -> Settings {
@@ -72,15 +72,36 @@ fn unsupported_input_is_rejected_before_loading_vendor_code() {
     }
 }
 #[test]
-fn frozen_stream_controls_precede_metadata_and_retire_with_stream() {
+fn stream_controls_update_atomically_and_retire_with_stream() {
     let mut processor = Processor::new(settings());
     let json = br#"{"rtx_hdr_enable":true,"rtx_hdr_peak_brightness":1400,"rtx_hdr_middle_gray":50,"rtx_hdr_contrast":5,"rtx_hdr_saturation":-5,"rtx_hdr_debanding":true}"#;
     processor.configure_stream(9, json).unwrap();
-    assert_eq!(processor.hdr_metadata(9).unwrap().fields[8], 1400);
+    assert_eq!(processor.hdr_metadata(9).unwrap().fields[8], 2000);
+    let updated = br#"{"rtx_hdr_enable":true,"rtx_hdr_peak_brightness":1800,"rtx_hdr_middle_gray":60,"rtx_hdr_contrast":10,"rtx_hdr_saturation":-5,"rtx_hdr_debanding":false}"#;
+    processor.update_stream(9, updated).unwrap();
+    assert_eq!(processor.stream_settings[&9].peak_luminance, 1800);
+    assert_eq!(processor.hdr_metadata(9).unwrap().fields[8], 2000);
+    assert_eq!(
+        processor.update_stream(9, b"{}"),
+        Err(STATUS_INVALID_ARGUMENT)
+    );
+    assert_eq!(processor.stream_settings[&9].peak_luminance, 1800);
+    assert_eq!(
+        processor.update_stream(10, updated),
+        Err(STATUS_INVALID_ARGUMENT)
+    );
+    let mut hijacked: serde_json::Value = serde_json::from_slice(updated).unwrap();
+    hijacked["foreground_target"] = serde_json::json!({"kind":"stream","host_epoch":"epoch","session_id":"other","stream_id":"stream","generation":1});
+    assert_eq!(
+        processor.update_stream(9, &serde_json::to_vec(&hijacked).unwrap()),
+        Err(STATUS_INVALID_ARGUMENT)
+    );
+    assert_eq!(processor.stream_settings[&9].peak_luminance, 1800);
     assert_eq!(processor.configure_stream(9, json), Err(MEDIA_BUSY));
     assert_eq!(processor.configure_stream(10, json), Err(MEDIA_BUSY));
     processor.cancel(9);
     assert_eq!(processor.configure_stream(9, json), Err(MEDIA_CLOSED));
+    assert_eq!(processor.update_stream(9, updated), Err(MEDIA_CLOSED));
     processor.configure_stream(10, json).unwrap();
     processor.cancel(10);
 }
@@ -154,27 +175,204 @@ fn read(lease: &DmaBufFrameLease) -> Vec<u32> {
         },
         0
     );
-    let mut vendor = vec![0; pixels.len()];
+    pixels
+}
+
+fn nits(code: u32) -> f64 {
+    let p = (f64::from(code) / 1023.0).powf(32.0 / 2523.0);
+    10000.0 * ((p - 0.8359375).max(0.0) / (18.8515625 - 18.6875 * p)).powf(16384.0 / 2610.0)
+}
+
+#[test]
+#[ignore = "requires an NVIDIA RTX GPU and AMATERASU_TRUEHDR_RUNTIME pointing to the licensed VFX runtime"]
+fn nvidia_live_tuning_preserves_held_frames_and_calibrates_fallback() {
+    let mut config = settings();
+    config.runtime_directory = std::env::var_os("AMATERASU_TRUEHDR_RUNTIME")
+        .expect("runtime path")
+        .into();
+    config.output_buffers = 2;
+    config.peak_luminance = 1000;
+    let stream = Stream::open(&config, 512, 288, None).unwrap();
+    let session = stream.slots[0].session.clone();
+    let source = Source::new(session.clone());
+    let mut processor = Processor::new(config.clone());
+    processor.streams.insert(77, stream);
+    let raw = into_gpu_binding(processor);
+    let api = unsafe { &*raw };
+    let input = source.lease();
+    let mut held = None;
+    let mut initial = Vec::new();
     assert_eq!(
         unsafe {
-            am_rtx_test_read_vendor(
-                state.slot.session.0.as_ptr(),
-                vendor.as_mut_ptr(),
-                vendor.len(),
+            process_gpu(api, 77, &input, CAPTURE_FRAME_FRESH, |output| {
+                initial = read(output);
+                assert_eq!(output.retain.unwrap()(output.context), STATUS_OK);
+                held = Some(*output);
+                STATUS_OK
+            })
+        },
+        ProcessingOutcome::Accepted
+    );
+    let held = held.unwrap();
+    let mut vendor = vec![0; initial.len()];
+    assert_eq!(
+        unsafe { am_rtx_test_read_vendor(session.0.as_ptr(), vendor.as_mut_ptr(), vendor.len()) },
+        0
+    );
+    assert!(
+        initial
+            .iter()
+            .zip(&vendor)
+            .all(|(a, b)| a & 0x3fff_ffff == b & 0x3fff_ffff)
+    );
+
+    config.peak_luminance = 2000;
+    let live = br#"{"rtx_hdr_enable":true,"rtx_hdr_peak_brightness":2000,"rtx_hdr_middle_gray":50,"rtx_hdr_contrast":0,"rtx_hdr_saturation":0,"rtx_hdr_debanding":true}"#;
+    assert_eq!(unsafe { update_gpu_stream(api, 77, live) }, Ok(()));
+    let mut peak = Vec::new();
+    assert_eq!(
+        unsafe {
+            process_gpu(api, 77, &input, CAPTURE_FRAME_FRESH, |output| {
+                peak = read(output);
+                STATUS_OK
+            })
+        },
+        ProcessingOutcome::Accepted
+    );
+    assert_eq!(
+        read(&held),
+        initial,
+        "reconfiguration must preserve leased pixels"
+    );
+    let highlight = nits(peak[300] & 1023);
+    eprintln!(
+        "2000-nit setting: white={highlight:.1} nits; baseline={:.1} nits",
+        nits(initial[300] & 1023)
+    );
+    assert!(
+        (highlight / 2000.0 - 1.0).abs() < 0.08,
+        "peak calibration did not reach target"
+    );
+    assert!(
+        nits(peak[511] & 1023) < 0.01,
+        "calibration must preserve black"
+    );
+    for requested_peak in [1200, 1600, 2000] {
+        for requested_gray in [10, 50] {
+            config.peak_luminance = requested_peak;
+            config.middle_gray = requested_gray;
+            Stream::configure_session(&session, &config, true, None).unwrap();
+            let mut sample = Vec::new();
+            assert_eq!(
+                unsafe {
+                    process_gpu(api, 77, &input, CAPTURE_FRAME_FRESH, |output| {
+                        sample = read(output);
+                        STATUS_OK
+                    })
+                },
+                ProcessingOutcome::Accepted
+            );
+            let white = nits(sample[300] & 1023);
+            eprintln!("peak={requested_peak}, gray={requested_gray}: white={white:.1} nits");
+            assert!((white / f64::from(requested_peak) - 1.0).abs() < 0.08);
+            assert!(
+                sample
+                    .iter()
+                    .all(|p| [0, 10, 20].iter().all(|shift| (p >> shift) & 1023 <= 846))
+            );
+            assert!(nits(sample[511] & 1023) < 0.01);
+        }
+    }
+    let rejected = br#"{"rtx_hdr_enable":true,"rtx_hdr_peak_brightness":2001,"rtx_hdr_middle_gray":50,"rtx_hdr_contrast":0,"rtx_hdr_saturation":0,"rtx_hdr_debanding":true}"#;
+    assert_eq!(
+        unsafe { update_gpu_stream(api, 77, rejected) },
+        Err(STATUS_INVALID_ARGUMENT)
+    );
+    let invalid = [201u32, 100, 50, 1000, 0];
+    let mut error = [0; 512];
+    assert_ne!(
+        unsafe {
+            am_rtx_configure(
+                session.0.as_ptr(),
+                invalid.as_ptr(),
+                false,
+                0,
+                error.as_mut_ptr(),
+                error.len(),
             )
         },
         0
     );
-    assert!(
-        pixels
-            .iter()
-            .zip(&vendor)
-            .all(|(exported, native)| exported & 0x3fff_ffff == native & 0x3fff_ffff),
-        "exported RGB codes differ from vendor output: export={:#x}, vendor={:#x}",
-        pixels[0],
-        vendor[0]
+    let mut after_rejection = Vec::new();
+    assert_eq!(
+        unsafe {
+            process_gpu(api, 77, &input, CAPTURE_FRAME_FRESH, |output| {
+                after_rejection = read(output);
+                STATUS_OK
+            })
+        },
+        ProcessingOutcome::Accepted
     );
-    pixels
+    assert!(
+        nits(after_rejection[300] & 1023) > 1900.0,
+        "rejected update changed the active conversion"
+    );
+    config.peak_luminance = 1000;
+    for control in ["contrast", "saturation", "middle_gray", "debanding"] {
+        let mut changed = config.clone();
+        match control {
+            "contrast" => changed.contrast = 0,
+            "saturation" => changed.saturation = 0,
+            "middle_gray" => changed.middle_gray = 10,
+            "debanding" => changed.debanding = false,
+            _ => unreachable!(),
+        }
+        Stream::configure_session(&session, &changed, true, None).unwrap();
+        let mut sample = Vec::new();
+        assert_eq!(
+            unsafe {
+                process_gpu(api, 77, &input, CAPTURE_FRAME_FRESH, |output| {
+                    sample = read(output);
+                    STATUS_OK
+                })
+            },
+            ProcessingOutcome::Accepted
+        );
+        if control != "debanding" {
+            assert_ne!(sample, initial, "live {control} must alter sampled pixels");
+        }
+    }
+    Stream::configure_session(&session, &config, false, None).unwrap();
+    let mut fallback_100 = Vec::new();
+    assert_eq!(
+        unsafe {
+            process_gpu(api, 77, &input, CAPTURE_FRAME_FRESH, |output| {
+                fallback_100 = read(output);
+                STATUS_OK
+            })
+        },
+        ProcessingOutcome::Accepted
+    );
+    config.sdr_brightness = 100;
+    Stream::configure_session(&session, &config, false, None).unwrap();
+    let mut fallback_200 = Vec::new();
+    assert_eq!(
+        unsafe {
+            process_gpu(api, 77, &input, CAPTURE_FRAME_FRESH, |output| {
+                fallback_200 = read(output);
+                STATUS_OK
+            })
+        },
+        ProcessingOutcome::Accepted
+    );
+    assert!((nits(fallback_100[300] & 1023) - 100.0).abs() < 3.0);
+    assert!((nits(fallback_200[300] & 1023) - 200.0).abs() < 5.0);
+    assert_eq!(read(&held), initial);
+    unsafe {
+        held.release.unwrap()(held.context, -1);
+        (api.cancel_dmabuf_leases)(api.base.context, 77);
+        api.base.release.unwrap()(api.base.context);
+    }
 }
 
 #[test]

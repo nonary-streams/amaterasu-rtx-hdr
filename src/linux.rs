@@ -26,6 +26,14 @@ unsafe extern "C" {
         capacity: usize,
     ) -> *mut c_void;
     fn am_rtx_close(context: *mut c_void);
+    fn am_rtx_configure(
+        context: *mut c_void,
+        parameters: *const u32,
+        enabled: bool,
+        sdr_brightness: u32,
+        error: *mut c_char,
+        capacity: usize,
+    ) -> i32;
     fn am_rtx_output_open(
         context: *mut c_void,
         frame: *mut DmaBufFrame,
@@ -72,6 +80,7 @@ struct Stream {
     slots: Vec<Rc<Slot>>,
     width: u32,
     height: u32,
+    enabled: bool,
 }
 struct Lease {
     slot: Rc<Slot>,
@@ -152,6 +161,7 @@ impl Stream {
         let session = Rc::new(NativeSession(
             NonNull::new(raw).ok_or_else(|| backend_failure(&error, logger))?,
         ));
+        Self::configure_session(&session, settings, true, logger)?;
         let mut slots = Vec::new();
         for _ in 0..settings.output_buffers {
             // SAFETY: zeroed scalar descriptor is initialized by successful open.
@@ -176,7 +186,41 @@ impl Stream {
             slots,
             width,
             height,
+            enabled: true,
         })
+    }
+
+    fn configure_session(
+        session: &NativeSession,
+        settings: &Settings,
+        enabled: bool,
+        logger: Option<&amaterasu_module_sdk::LogEmitter>,
+    ) -> Result<(), Status> {
+        let mut error = [0; 512];
+        // SAFETY: the session and parameter array remain valid for the synchronous call.
+        let result = unsafe {
+            am_rtx_configure(
+                session.0.as_ptr(),
+                settings.parameters().as_ptr(),
+                enabled,
+                settings.sdr_brightness,
+                error.as_mut_ptr(),
+                error.len(),
+            )
+        };
+        if result != 0 {
+            return Err(backend_failure(&error, logger));
+        }
+        Ok(())
+    }
+
+    fn configure(
+        &self,
+        settings: &Settings,
+        enabled: bool,
+        logger: Option<&amaterasu_module_sdk::LogEmitter>,
+    ) -> Result<(), Status> {
+        Self::configure_session(&self.slots[0].session, settings, enabled, logger)
     }
 
     fn process(
@@ -241,6 +285,8 @@ impl Stream {
 pub(crate) struct Processor {
     settings: Settings,
     stream_settings: BTreeMap<u64, Settings>,
+    targets: BTreeMap<u64, Option<amaterasu_module_sdk::extension_api::LifecycleTarget>>,
+    policy: Option<std::sync::Arc<std::sync::Mutex<crate::foreground_policy::ForegroundPolicy>>>,
     streams: BTreeMap<u64, Stream>,
     retired: BTreeSet<u64>,
     logger: Option<amaterasu_module_sdk::LogEmitter>,
@@ -250,10 +296,19 @@ impl Processor {
         Self {
             settings,
             stream_settings: BTreeMap::new(),
+            targets: BTreeMap::new(),
+            policy: None,
             streams: BTreeMap::new(),
             retired: BTreeSet::new(),
             logger: None,
         }
+    }
+    pub fn with_policy(
+        mut self,
+        policy: std::sync::Arc<std::sync::Mutex<crate::foreground_policy::ForegroundPolicy>>,
+    ) -> Self {
+        self.policy = Some(policy);
+        self
     }
     pub fn with_logger(mut self, logger: amaterasu_module_sdk::LogEmitter) -> Self {
         self.logger = Some(logger);
@@ -276,6 +331,28 @@ impl GpuFrameProcessor for Processor {
         let settings = controls
             .apply(&self.settings)
             .map_err(|_| STATUS_INVALID_ARGUMENT)?;
+        self.targets.insert(stream, controls.foreground_target);
+        self.stream_settings.insert(stream, settings);
+        Ok(())
+    }
+    fn update_stream(&mut self, stream: u64, json: &[u8]) -> Result<(), Status> {
+        if self.retired.contains(&stream) {
+            return Err(MEDIA_CLOSED);
+        }
+        if !self.stream_settings.contains_key(&stream) && !self.streams.contains_key(&stream) {
+            return Err(STATUS_INVALID_ARGUMENT);
+        }
+        let controls: crate::settings::StreamSettings =
+            serde_json::from_slice(json).map_err(|_| STATUS_INVALID_ARGUMENT)?;
+        let settings = controls
+            .apply(&self.settings)
+            .map_err(|_| STATUS_INVALID_ARGUMENT)?;
+        if self.targets.get(&stream).cloned().flatten() != controls.foreground_target {
+            return Err(STATUS_INVALID_ARGUMENT);
+        }
+        if let Some(active) = self.streams.get(&stream) {
+            active.configure(&settings, active.enabled, self.logger.as_ref())?;
+        }
         self.stream_settings.insert(stream, settings);
         Ok(())
     }
@@ -301,10 +378,29 @@ impl GpuFrameProcessor for Processor {
                 )?,
             );
         }
-        self.streams[&stream].process(frame, self.logger.as_ref())
+        let settings = self.stream_settings.get(&stream).unwrap_or(&self.settings);
+        let enabled = !settings.foreground_only
+            || self.policy.as_ref().is_some_and(|policy| {
+                self.targets
+                    .get(&stream)
+                    .and_then(Option::as_ref)
+                    .is_some_and(|target| {
+                        policy
+                            .lock()
+                            .ok()
+                            .is_some_and(|policy| policy.enabled(target, std::time::Instant::now()))
+                    })
+            });
+        let active = self.streams.get_mut(&stream).expect("stream was opened");
+        if active.enabled != enabled {
+            active.configure(settings, enabled, self.logger.as_ref())?;
+            active.enabled = enabled;
+        }
+        active.process(frame, self.logger.as_ref())
     }
     fn cancel(&mut self, stream: u64) {
         self.stream_settings.remove(&stream);
+        self.targets.remove(&stream);
         if let Some(active) = self.streams.remove(&stream) {
             active.assert_retired();
         }
@@ -318,6 +414,7 @@ impl GpuFrameProcessor for Processor {
         }
         self.streams.clear();
         self.stream_settings.clear();
+        self.targets.clear();
     }
     fn hdr_metadata(&self, stream: u64) -> Option<HdrMetadata> {
         Some(

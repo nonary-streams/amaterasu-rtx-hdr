@@ -28,7 +28,7 @@
           "paired_client",
           "session"
         ],
-        "apply_policy": "next_stream",
+        "apply_policy": "live_action",
         "definition": {
           "default": 1000,
           "maximum": 2000,
@@ -38,7 +38,7 @@
         "help": "Set the target HDR peak brightness.",
         "id": "rtx_hdr_peak_brightness",
         "label": "Peak brightness (nits)",
-        "presentation": null,
+        "presentation": "slider",
         "required_capabilities": []
       },
       {
@@ -48,7 +48,7 @@
           "paired_client",
           "session"
         ],
-        "apply_policy": "next_stream",
+        "apply_policy": "live_action",
         "definition": {
           "default": 50,
           "maximum": 100,
@@ -58,7 +58,7 @@
         "help": "Adjust the brightness of midtones.",
         "id": "rtx_hdr_middle_gray",
         "label": "Middle gray",
-        "presentation": null,
+        "presentation": "slider",
         "required_capabilities": []
       },
       {
@@ -68,7 +68,7 @@
           "paired_client",
           "session"
         ],
-        "apply_policy": "next_stream",
+        "apply_policy": "live_action",
         "definition": {
           "default": 0,
           "maximum": 100,
@@ -78,7 +78,7 @@
         "help": "Adjust the contrast of the HDR conversion.",
         "id": "rtx_hdr_contrast",
         "label": "Contrast",
-        "presentation": null,
+        "presentation": "slider",
         "required_capabilities": []
       },
       {
@@ -88,7 +88,7 @@
           "paired_client",
           "session"
         ],
-        "apply_policy": "next_stream",
+        "apply_policy": "live_action",
         "definition": {
           "default": 0,
           "maximum": 100,
@@ -98,6 +98,24 @@
         "help": "Adjust color saturation of the HDR conversion.",
         "id": "rtx_hdr_saturation",
         "label": "Saturation",
+        "presentation": "slider",
+        "required_capabilities": []
+      },
+      {
+        "allowed_scopes": [
+          "host",
+          "application",
+          "paired_client",
+          "session"
+        ],
+        "apply_policy": "live_action",
+        "definition": {
+          "default": false,
+          "type": "boolean"
+        },
+        "help": "Use SDR fallback while the application is not in the foreground or its state is unavailable.",
+        "id": "rtx_hdr_foreground_only",
+        "label": "Only convert the foreground application",
         "presentation": null,
         "required_capabilities": []
       },
@@ -108,7 +126,27 @@
           "paired_client",
           "session"
         ],
-        "apply_policy": "next_stream",
+        "apply_policy": "live_action",
+        "definition": {
+          "default": 0,
+          "maximum": 100,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "help": "Adjust SDR fallback brightness when conversion is inactive.",
+        "id": "rtx_hdr_sdr_brightness",
+        "label": "SDR fallback brightness",
+        "presentation": "slider",
+        "required_capabilities": []
+      },
+      {
+        "allowed_scopes": [
+          "host",
+          "application",
+          "paired_client",
+          "session"
+        ],
+        "apply_policy": "live_action",
         "definition": {
           "default": true,
           "type": "boolean"

@@ -11,6 +11,7 @@
 #include <cudaGL.h>
 #include <gbm.h>
 #include <memory>
+#include <array>
 #include <stdexcept>
 #include <string>
 
@@ -75,7 +76,7 @@ struct Surface {
     PFNEGLDESTROYIMAGEKHRPROC destroy_image = nullptr;
     PFNGLEGLIMAGETARGETTEXTURE2DOESPROC bind_image = nullptr;
     GLuint input = 0, output = 0, input_fbo = 0, output_fbo = 0;
-    GLuint source = 0, program = 0, output_program = 0, vao = 0;
+    GLuint source = 0, program = 0, output_program = 0, fallback_program = 0, vao = 0;
     void open(CUdevice device);
     void prepare(uint32_t width, uint32_t height);
     EGLImageKHR import(const AmaterasuDmaBufFrame &frame);
@@ -114,10 +115,15 @@ struct Session {
     void *effect = nullptr;
     CUgraphicsResource input_resource = nullptr, output_resource = nullptr;
     bool retained_context = false;
+    bool enabled = true;
+    uint32_t sdr_brightness = 0;
+    std::array<uint32_t, 5> parameters{};
     Session(const std::string &root, int ordinal, uint32_t width, uint32_t height,
             const uint32_t *parameters);
     ~Session();
     void run(const AmaterasuDmaBufFrame &frame, Output &destination);
+    void configure(const uint32_t *values, bool active, uint32_t brightness);
+    void *create_configured_effect(const uint32_t *values);
     void close();
 };
 } // namespace rtx
@@ -128,5 +134,6 @@ void am_rtx_close(void *);
 void *am_rtx_output_open(void *, AmaterasuDmaBufFrame *, char *, size_t);
 void am_rtx_output_close(void *, void *);
 int am_rtx_process(void *, const AmaterasuDmaBufFrame *, void *, char *, size_t);
+int am_rtx_configure(void *, const uint32_t *, bool, uint32_t, char *, size_t);
 int am_rtx_wait_fence(int);
 }

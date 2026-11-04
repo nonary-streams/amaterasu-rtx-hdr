@@ -1,7 +1,7 @@
 //! Settings exposed by the optional RTX HDR provider.
 use amaterasu_configuration_schema::{Definition, Fields, Values};
 use amaterasu_module_sdk::extension_api::{
-    ApplyPolicy, ExtensionDescriptor, MethodRef, OptionDescriptor, SettingScope,
+    ApplyPolicy, ExtensionDescriptor, MethodRef, OptionDescriptor, OptionPresentation, SettingScope,
 };
 
 pub const PROVIDER: &str = "amaterasu.rtx-hdr";
@@ -23,6 +23,11 @@ pub fn definitions() -> Fields {
         ("rtx_hdr_contrast", integer(0, -100, 100)),
         ("rtx_hdr_saturation", integer(0, -100, 100)),
         ("rtx_hdr_debanding", Definition::Boolean { default: true }),
+        ("rtx_hdr_sdr_brightness", integer(0, 0, 100)),
+        (
+            "rtx_hdr_foreground_only",
+            Definition::Boolean { default: false },
+        ),
     ]
     .into_iter()
     .map(|(name, definition)| (name.into(), definition))
@@ -66,6 +71,16 @@ pub fn descriptor() -> ExtensionDescriptor {
             "Adjust color saturation of the HDR conversion.",
         ),
         (
+            "rtx_hdr_foreground_only",
+            "Only convert the foreground application",
+            "Use SDR fallback while the application is not in the foreground or its state is unavailable.",
+        ),
+        (
+            "rtx_hdr_sdr_brightness",
+            "SDR fallback brightness",
+            "Adjust SDR fallback brightness when conversion is inactive.",
+        ),
+        (
             "rtx_hdr_debanding",
             "Debanding",
             "Reduce visible bands in gradients.",
@@ -78,7 +93,10 @@ pub fn descriptor() -> ExtensionDescriptor {
             label: label.into(),
             help: help.into(),
             definition: fields[id].clone(),
-            presentation: None,
+            presentation: match fields[id] {
+                Definition::Integer { .. } => Some(OptionPresentation::Slider),
+                _ => None,
+            },
             allowed_scopes: if id == "rtx_hdr_enable" {
                 // Enablement selects the source range during session prepare;
                 // a live session override cannot be applied to that session and
@@ -99,7 +117,7 @@ pub fn descriptor() -> ExtensionDescriptor {
             apply_policy: if id == "rtx_hdr_enable" {
                 ApplyPolicy::NextSession
             } else {
-                ApplyPolicy::NextStream
+                ApplyPolicy::LiveAction
             },
             required_capabilities: vec![],
             choice_labels: Default::default(),
@@ -153,6 +171,26 @@ mod tests {
         assert_eq!(enable.apply_policy, ApplyPolicy::NextSession);
         assert!(!enable.allowed_scopes.contains(&SettingScope::Session));
         assert!(enable.allowed_scopes.contains(&SettingScope::PairedClient));
+        for option in descriptor
+            .options
+            .iter()
+            .filter(|option| option.id != "rtx_hdr_enable")
+        {
+            assert_eq!(
+                option.apply_policy,
+                ApplyPolicy::LiveAction,
+                "{}",
+                option.id
+            );
+            if option.id != "rtx_hdr_debanding" && option.id != "rtx_hdr_foreground_only" {
+                assert_eq!(
+                    option.presentation,
+                    Some(OptionPresentation::Slider),
+                    "{}",
+                    option.id
+                );
+            }
+        }
         let mut values = amaterasu_configuration_schema::defaults(&definitions()).unwrap();
         assert_eq!(values["rtx_hdr_enable"], false);
         assert!(validate(&values).is_ok());

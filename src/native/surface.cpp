@@ -133,10 +133,58 @@ void Surface::prepare(uint32_t width, uint32_t height) {
     const char *fragment = "#version 330\n"
                            "in vec2 uv; uniform sampler2D source; out vec4 color;"
                            "void main(){color=vec4(texture(source,uv).rgb,1.0);}";
-    const char *unpack = "#version 330\n"
-                         "uniform usampler2D source;out vec4 color;void main(){"
-                         "uint p=texelFetch(source,ivec2(gl_FragCoord.xy),0).r;"
-                         "color=vec4(vec3(p&1023u,(p>>10)&1023u,(p>>20)&1023u)/1023.0,1.0);}";
+    // ST 2084 decode and encode permit calibration in absolute light rather
+    // than scaling PQ code values, which would distort shadows and black.
+    const char *unpack = R"GLSL(#version 330
+uniform usampler2D source;
+uniform float peak, gray;
+out vec4 color;
+vec3 decodePQ(vec3 v) {
+    vec3 p = pow(v, vec3(32.0 / 2523.0));
+    return 10000.0 * pow(max(p - 0.8359375, 0.0) /
+        (18.8515625 - 18.6875 * p), vec3(16384.0 / 2610.0));
+}
+vec3 encodePQ(vec3 nits) {
+    vec3 p = pow(clamp(nits / 10000.0, 0.0, 1.0), vec3(2610.0 / 16384.0));
+    return pow((0.8359375 + 18.8515625 * p) / (1.0 + 18.6875 * p), vec3(2523.0 / 32.0));
+}
+void main() {
+    uint p = texelFetch(source, ivec2(gl_FragCoord.xy), 0).r;
+    vec3 code = vec3(p & 1023u, (p >> 10) & 1023u, (p >> 20) & 1023u) / 1023.0;
+    if (peak > 1000.0) {
+        float nativeGray = clamp(floor(gray * 1000.0 / peak + 0.5), 10.0, 100.0);
+        vec3 light = decodePQ(code);
+        // When the model's minimum gray is reached, interpolate through the
+        // requested gray anchor and peak rather than lifting the midtones.
+        if (gray * 1000.0 / peak < 10.0) {
+            vec3 low = light * (gray / nativeGray);
+            vec3 high = gray + (light - nativeGray) * (peak - gray) / (1000.0 - nativeGray);
+            light = mix(low, high, greaterThan(light, vec3(nativeGray)));
+        } else {
+            light *= peak / 1000.0;
+        }
+        code = encodePQ(light);
+    }
+    // The stream advertises a fixed 2000-nit mastering ceiling so that live
+    // peak adjustments never invalidate encoder metadata.
+    color = vec4(min(code, vec3(846.0 / 1023.0)), 1.0);
+})GLSL";
+    const char *fallback = R"GLSL(#version 330
+uniform sampler2D source;
+uniform float white_nits;
+out vec4 color;
+void main() {
+    vec3 c = texelFetch(source, ivec2(gl_FragCoord.xy), 0).rgb;
+    vec3 linear = mix(c / 12.92, pow((c + 0.055) / 1.055, vec3(2.4)),
+                      greaterThan(c, vec3(0.04045)));
+    // Convert linear BT.709 primaries to BT.2020 before PQ encoding.
+    vec3 wide = mat3(0.627404, 0.069097, 0.016391,
+                     0.329283, 0.919540, 0.088013,
+                     0.043313, 0.011362, 0.895595) * linear;
+    vec3 p = pow(max(wide, 0.0) * (white_nits / 10000.0), vec3(2610.0 / 16384.0));
+    color = vec4(pow((0.8359375 + 18.8515625 * p) / (1.0 + 18.6875 * p),
+                     vec3(2523.0 / 32.0)), 1.0);
+})GLSL";
     GLuint vs = shader(GL_VERTEX_SHADER, vertex), fs = 0;
     try {
         fs = shader(GL_FRAGMENT_SHADER, fragment);
@@ -174,6 +222,24 @@ void Surface::prepare(uint32_t width, uint32_t height) {
         throw std::runtime_error("HDR unpack shader link failed");
     glUseProgram(output_program);
     glUniform1i(glGetUniformLocation(output_program, "source"), 0);
+    vs = shader(GL_VERTEX_SHADER, vertex);
+    try {
+        fs = shader(GL_FRAGMENT_SHADER, fallback);
+    } catch (...) {
+        glDeleteShader(vs);
+        throw;
+    }
+    fallback_program = glCreateProgram();
+    glAttachShader(fallback_program, vs);
+    glAttachShader(fallback_program, fs);
+    glLinkProgram(fallback_program);
+    glDeleteShader(vs);
+    glDeleteShader(fs);
+    glGetProgramiv(fallback_program, GL_LINK_STATUS, &linked);
+    if (!linked)
+        throw std::runtime_error("SDR fallback shader link failed");
+    glUseProgram(fallback_program);
+    glUniform1i(glGetUniformLocation(fallback_program, "source"), 0);
     glDisable(GL_DITHER);
     glDisable(GL_BLEND);
     glDisable(GL_FRAMEBUFFER_SRGB);
@@ -247,6 +313,7 @@ void Surface::close() {
     glDeleteVertexArrays(1, &vao);
     glDeleteProgram(program);
     glDeleteProgram(output_program);
+    glDeleteProgram(fallback_program);
 }
 
 void Output::open(Surface &surface, uint32_t width, uint32_t height, uint32_t format) {

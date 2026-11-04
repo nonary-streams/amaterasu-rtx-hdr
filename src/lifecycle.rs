@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 #[serde(deny_unknown_fields)]
 pub(crate) struct Selection {
     principal: String,
-    service: String,
+    pub(crate) service: String,
 }
 
 pub(crate) fn selection(settings: &Value) -> ModuleResult<Option<Selection>> {
@@ -294,11 +294,15 @@ pub(crate) fn intent(caller: &str, allowed: &[String], payload: Value) -> Value 
     let Some(enabled) = settings.get("rtx_hdr_enable").and_then(Value::as_bool) else {
         return reject("invalid_settings");
     };
+    let mut processor_settings = settings.clone();
+    if let Some(object) = processor_settings.as_object_mut() {
+        object.insert("foreground_target".into(), target.clone());
+    }
     json!({"status":"succeeded", "target":target, "revision":revision,
         "enabled":enabled,
         "source_hdr_required":if enabled { Some(false) } else { None },
         "output_hdr_required":if enabled { Some(true) } else { None },
-        "processor_settings":settings, "processor_service":crate::SERVICE})
+        "processor_settings":processor_settings, "processor_service":crate::SERVICE})
 }
 
 #[cfg(test)]
@@ -384,10 +388,7 @@ mod tests {
         assert_eq!(enabled["output_hdr_required"], true);
         assert_eq!(enabled["target"], target);
         assert_eq!(enabled["revision"], "snapshot");
-        assert_eq!(
-            enabled["processor_settings"],
-            request["arguments"]["settings"]
-        );
+        assert_eq!(enabled["processor_settings"]["foreground_target"], target);
         request["arguments"]["settings"]["rtx_hdr_peak_brightness"] = json!(2001);
         assert_eq!(
             intent("stream.consumer", &allowed, request)["reason"],

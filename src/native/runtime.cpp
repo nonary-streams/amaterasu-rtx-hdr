@@ -230,6 +230,18 @@ extern "C" int am_rtx_process(void *context, const AmaterasuDmaBufFrame *frame, 
         return -1;
     }
 }
+extern "C" int am_rtx_configure(void *context, const uint32_t *parameters, bool enabled,
+                                 uint32_t brightness, char *error, size_t capacity) {
+    auto &session = *static_cast<rtx::Session *>(context);
+    try {
+        rtx::Current current(*session.api, session.surface, session.context);
+        session.configure(parameters, enabled, brightness);
+        return 0;
+    } catch (const std::exception &failure) {
+        report(error, capacity, failure);
+        return -1;
+    }
+}
 extern "C" int am_rtx_wait_fence(int fd) {
     try {
         rtx::wait_fence(fd);

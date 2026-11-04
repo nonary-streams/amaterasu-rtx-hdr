@@ -36,6 +36,7 @@ Example plugin startup settings:
   "middle_gray": 50,
   "peak_luminance": 650,
   "debanding": true,
+  "sdr_brightness": 0,
   "max_streams": 1,
   "output_buffers": 3
 }
@@ -93,9 +94,25 @@ effect allocations, surfaces, fds and streams retire with their owners.
 
 Processor v1.1 supplies output HDR10 metadata through the SDK. This prevents
 video from advertising the original SDR source's metadata for converted pixels.
-The mastering luminance is the configured target; unknown measured content
+The mastering luminance is the fixed 2000-nit supported ceiling, while the
+configured target can change within that ceiling. Unknown measured content
 light levels remain zero. Video checks the output dynamic range before invoking
 the effect and fails an incompatible stream without skipping processing.
+
+## Foreground policy
+
+`rtx_hdr_foreground_only` defaults to false. When enabled, the plugin applies
+TrueHDR only while the selected foreground provider reports the exact executable
+associated with the stream lifecycle target. Missing, stale, or mismatched
+observations use the SDR-in-HDR fallback. Trusted startup composition must set
+`foreground_context_service` and grant this plugin access to the selected
+`amaterasu.foreground-context/1` implementation and to lifecycle
+`read_provider_context`. No observer is silently selected. Foreground identity
+is an absolute executable path; launchers, Steam URIs and Proton/Wine processes
+may not match a game's configured executable, so these cases fall back rather
+than establishing game identity. Native Wayland requires a compositor-backed
+provider; an X11 observer cannot see all native Wayland windows. The foreground
+policy has not been qualified in an installed host or live gameplay.
 
 ## Validation and remaining parity
 
@@ -116,12 +133,11 @@ Readback exists only in the test harness. This was exercised on an RTX 4090 with
 driver 615.71.09. It does not establish installed-host, encoded-stream, client
 display brightness, or Windows/NVIDIA App pixel parity.
 
-Vibeshine was used as a behavioral reference. Windows resource integration,
-per-application/foreground policy, live control changes, Vibeshine's additional
-peak-luminance correction/calibration and fullscreen detection remain separate
-parity work. Controls here map directly to the NVIDIA VFX parameters, without
-claiming parity with Vibeshine's corrected tuning. This change does not install
-or activate the plugin in an existing host profile.
+Vibeshine was used as a behavioral reference. Windows resource integration
+and fullscreen detection remain separate parity work. The live controls and peak
+correction are independently implemented; numerical equivalence with Vibeshine
+has not been measured. This change does not install or activate the plugin in an
+existing host profile.
 
 References: [NVIDIA TrueHDR filter](https://docs.nvidia.com/maxine/vfx/latest/Filters/TrueHDR.html),
 [Processing SDK](../../docs/gpu-processing-sdk.md).

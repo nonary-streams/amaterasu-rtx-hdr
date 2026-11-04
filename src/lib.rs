@@ -4,6 +4,10 @@
     allow(dead_code)
 )]
 mod extension;
+#[cfg(all(target_os = "linux", feature = "linux-nvidia"))]
+mod foreground_coordinator;
+#[allow(dead_code)]
+mod foreground_policy;
 #[cfg_attr(
     not(all(target_os = "linux", feature = "linux-nvidia")),
     allow(dead_code)
@@ -40,6 +44,8 @@ pub struct RtxHdr {
     lifecycle: Option<lifecycle::Selection>,
     #[cfg(all(target_os = "linux", feature = "linux-nvidia"))]
     processing_consumers: Vec<String>,
+    #[cfg(all(target_os = "linux", feature = "linux-nvidia"))]
+    foreground: Option<foreground_coordinator::Coordinator>,
 }
 
 impl ManagedModule for RtxHdr {
@@ -49,6 +55,26 @@ impl ManagedModule for RtxHdr {
         };
         let registry_principal = extension::registry_principal(&payload)?;
         let lifecycle = lifecycle::selection(&payload)?;
+        let foreground_service = match payload.get("foreground_context_service") {
+            None => None,
+            Some(value) => Some(
+                value
+                    .as_str()
+                    .filter(|name| {
+                        !name.is_empty()
+                            && name.len() <= 128
+                            && name.bytes().all(|b| {
+                                b.is_ascii_lowercase()
+                                    || b.is_ascii_digit()
+                                    || matches!(b, b'.' | b'_' | b'-' | b'/')
+                            })
+                    })
+                    .ok_or("invalid foreground context service")?
+                    .to_owned(),
+            ),
+        };
+        #[cfg(not(all(target_os = "linux", feature = "linux-nvidia")))]
+        let _ = &foreground_service;
         let processing_consumers: Vec<String> =
             match payload.get("processing_consumer_principals") {
                 Some(value) => serde_json::from_value(value.clone())
@@ -75,6 +101,7 @@ impl ManagedModule for RtxHdr {
             object.remove("extension_registry_principal");
             object.remove("lifecycle_coordinator");
             object.remove("processing_consumer_principals");
+            object.remove("foreground_context_service");
         }
         let settings: Settings = serde_json::from_value(settings_payload)
             .map_err(|error| format!("invalid RTX HDR settings: {error}"))?;
@@ -103,8 +130,16 @@ impl ManagedModule for RtxHdr {
                 ..settings
             };
             let (logger, logs) = runtime.log_emitter();
+            let policy = std::sync::Arc::new(std::sync::Mutex::new(
+                foreground_policy::ForegroundPolicy::default(),
+            ));
+            let processor_policy = policy.clone();
+            let foreground = foreground_service
+                .map(|service| foreground_coordinator::Coordinator::new(policy, service));
             let create: CreateProcessor = Box::new(move |_principal| {
-                Ok(linux::Processor::new(settings.clone()).with_logger(logger.clone()))
+                Ok(linux::Processor::new(settings.clone())
+                    .with_logger(logger.clone())
+                    .with_policy(processor_policy.clone()))
             });
             let factory = amaterasu_module_sdk::processing::GpuProcessorFactory::new(create);
             if registry_principal.is_some() {
@@ -131,6 +166,7 @@ impl ManagedModule for RtxHdr {
                 registry_principal,
                 lifecycle,
                 processing_consumers,
+                foreground,
             })
         }
         #[cfg(not(all(target_os = "linux", feature = "linux-nvidia")))]
@@ -141,6 +177,9 @@ impl ManagedModule for RtxHdr {
         #[cfg(all(target_os = "linux", feature = "linux-nvidia"))]
         {
             self.logs.flush(&self.runtime);
+            if let Some(foreground) = &mut self.foreground {
+                foreground.advance(&self.runtime);
+            }
             match self.runtime.send(Command::Poll {})? {
                 Response::Pending => {}
                 Response::Request {
@@ -160,12 +199,32 @@ impl ManagedModule for RtxHdr {
                             Some("processing_intent") => {
                                 lifecycle::intent(&caller, &self.processing_consumers, payload)
                             }
-                            _ => match &self.lifecycle {
-                                Some(selected) => lifecycle::handle(&caller, selected, payload),
-                                None => {
-                                    serde_json::json!({"status": "rejected", "reason": "lifecycle_not_selected"})
+                            _ => {
+                                match &self.lifecycle {
+                                    Some(selected) => {
+                                        let response =
+                                            lifecycle::handle(&caller, selected, payload.clone());
+                                        let request = payload.get("arguments").and_then(|arguments| serde_json::from_value::<amaterasu_module_sdk::extension_api::ProviderRequest>(arguments.clone()).ok());
+                                        if response
+                                            .get("status")
+                                            .and_then(serde_json::Value::as_str)
+                                            == Some("cleanup")
+                                            && let (Some(coordinator), Some(request)) =
+                                                (&self.foreground, &request)
+                                        {
+                                            coordinator.remove_target(&request.target);
+                                        }
+                                        if response.get("status").and_then(serde_json::Value::as_str) == Some("prepared")
+                                        && request.as_ref().is_some_and(|request| request.phase == amaterasu_module_sdk::extension_api::LifecyclePhase::StreamPrepare)
+                                        && let (Some(coordinator), Some(request)) = (&mut self.foreground, request)
+                                            && coordinator.queue_context(id, request, response.clone(), &selected.service) { return Ok(()); }
+                                        response
+                                    }
+                                    None => {
+                                        serde_json::json!({"status": "rejected", "reason": "lifecycle_not_selected"})
+                                    }
                                 }
-                            },
+                            }
                         }
                     } else {
                         serde_json::json!({"ok": false, "error": "unknown_service"})

@@ -23,6 +23,12 @@ pub struct Settings {
     pub peak_luminance: u32,
     #[serde(default = "default_debanding")]
     pub debanding: bool,
+    /// SDR fallback white level adjustment, in the inclusive range 0..=100.
+    #[serde(default)]
+    pub sdr_brightness: u32,
+    /// Gate conversion on the selected application being in the foreground.
+    #[serde(default)]
+    pub foreground_only: bool,
     #[serde(default = "default_streams")]
     pub max_streams: usize,
     #[serde(default = "default_buffers")]
@@ -55,6 +61,7 @@ impl Settings {
         if self.device > 15
             || self.contrast > 200
             || self.saturation > 200
+            || self.sdr_brightness > 100
             || !(10..=100).contains(&self.middle_gray)
             || !(400..=2000).contains(&self.peak_luminance)
             || !(1..=4).contains(&self.max_streams)
@@ -78,22 +85,13 @@ impl Settings {
 
     pub fn hdr_metadata(&self) -> HdrMetadata {
         // BT.2020/D65 mastering primaries, in the SDK's documented RGB order.
+        // Advertise the maximum supported mastering ceiling for the stream so
+        // live target changes never outrun the already-negotiated metadata.
         // Content light levels are unknown; do not invent measured MaxCLL/FALL.
         HdrMetadata {
             enabled: 1,
             fields: [
-                35400,
-                14600,
-                8500,
-                39850,
-                6550,
-                2300,
-                15635,
-                16450,
-                self.peak_luminance as u16,
-                0,
-                0,
-                0,
+                35400, 14600, 8500, 39850, 6550, 2300, 15635, 16450, 2000, 0, 0, 0,
             ],
             reserved: 0,
         }
@@ -112,6 +110,7 @@ mod tests {
         for (field, value) in [
             ("contrast", 201),
             ("saturation", 201),
+            ("sdr_brightness", 101),
             ("middle_gray", 9),
             ("peak_luminance", 2001),
             ("max_streams", 0),
@@ -131,13 +130,20 @@ mod tests {
         let mut relative = settings.clone();
         relative.runtime_directory = "relative".into();
         assert!(relative.validate().is_err());
-        assert_eq!(settings.hdr_metadata().fields[8], 650);
+        assert_eq!(settings.hdr_metadata().fields[8], 2000);
+        let mut brighter = settings.clone();
+        brighter.peak_luminance = 2000;
+        assert_eq!(
+            brighter.hdr_metadata().fields,
+            settings.hdr_metadata().fields
+        );
         assert_eq!(&settings.hdr_metadata().fields[10..], &[0, 0]);
     }
 }
 
-/// Frozen, provider-owned controls for a single stream. The runtime path and
-/// GPU allocation limits remain trusted startup configuration.
+/// Provider-owned controls for a single stream. Enablement is selected at
+/// admission; tuning may be updated while the stream is active. Runtime path
+/// and GPU allocation limits remain trusted startup configuration.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct StreamSettings {
@@ -147,6 +153,13 @@ pub struct StreamSettings {
     pub rtx_hdr_contrast: i32,
     pub rtx_hdr_saturation: i32,
     pub rtx_hdr_debanding: bool,
+    #[serde(default)]
+    pub rtx_hdr_sdr_brightness: u32,
+    #[serde(default)]
+    pub rtx_hdr_foreground_only: bool,
+    /// Admitted target used by this provider to resolve foreground policy.
+    #[serde(default)]
+    pub foreground_target: Option<amaterasu_module_sdk::extension_api::LifecycleTarget>,
 }
 
 impl StreamSettings {
@@ -163,6 +176,8 @@ impl StreamSettings {
         configured.middle_gray = self.rtx_hdr_middle_gray;
         configured.peak_luminance = self.rtx_hdr_peak_brightness;
         configured.debanding = self.rtx_hdr_debanding;
+        configured.sdr_brightness = self.rtx_hdr_sdr_brightness;
+        configured.foreground_only = self.rtx_hdr_foreground_only;
         configured.validate()?;
         Ok(configured)
     }
@@ -185,9 +200,26 @@ mod stream_settings_tests {
         let selected = controls.apply(&startup).unwrap();
         assert_eq!(selected.runtime_directory, startup.runtime_directory);
         assert_eq!(selected.parameters(), [0, 200, 50, 1000, 0]);
+        assert!(!selected.foreground_only);
+        assert!(controls.foreground_target.is_none());
+        controls.rtx_hdr_foreground_only = true;
+        assert!(controls.apply(&startup).unwrap().foreground_only);
+        let target = serde_json::json!({"kind":"session", "host_epoch":"host", "session_id":"session", "generation":1});
+        let mut with_target = serde_json::to_value(&controls).unwrap();
+        with_target["foreground_target"] = target;
+        assert!(
+            serde_json::from_value::<StreamSettings>(with_target)
+                .unwrap()
+                .foreground_target
+                .is_some()
+        );
         controls.rtx_hdr_contrast = 101;
         assert!(controls.apply(&startup).is_err());
         controls.rtx_hdr_contrast = 0;
+        controls.rtx_hdr_sdr_brightness = 101;
+        assert!(controls.apply(&startup).is_err());
+        controls.rtx_hdr_sdr_brightness = 100;
+        assert_eq!(controls.apply(&startup).unwrap().sdr_brightness, 100);
         controls.rtx_hdr_enable = false;
         assert!(controls.apply(&startup).is_err());
         assert!(

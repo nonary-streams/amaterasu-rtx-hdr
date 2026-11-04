@@ -17,6 +17,9 @@ extern "C" void *am_rtx_test_source(void *raw, AmaterasuDmaBufFrame *frame) {
             glScissor(0, 0, session.input.width / 2, session.input.height);
             glClearColor(0.7f, 0.3f, 0.1f, 1);
             glClear(GL_COLOR_BUFFER_BIT);
+            glScissor(session.input.width / 2, 0, session.input.width / 4, session.input.height);
+            glClearColor(1, 1, 1, 1);
+            glClear(GL_COLOR_BUFFER_BIT);
             glDisable(GL_SCISSOR_TEST);
             glFinish();
             if (glGetError() != GL_NO_ERROR)
