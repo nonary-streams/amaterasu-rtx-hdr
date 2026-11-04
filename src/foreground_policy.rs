@@ -9,7 +9,7 @@ const MAX_OBSERVATION_AGE: Duration = Duration::from_millis(1500);
 #[derive(Default)]
 pub(crate) struct ForegroundPolicy {
     applications: Vec<(LifecycleTarget, String)>,
-    observation: Option<(String, Instant)>,
+    observation: Option<(String, Option<bool>, Instant)>,
 }
 
 impl ForegroundPolicy {
@@ -33,14 +33,27 @@ impl ForegroundPolicy {
         self.applications.retain(|(existing, _)| existing != target);
     }
 
-    pub(crate) fn observe(&mut self, executable: Option<&str>, now: Instant) {
-        self.observation = executable
-            .filter(|path| valid_executable(path))
-            .map(|path| (path.to_owned(), now));
+    pub(crate) fn observe(
+        &mut self,
+        snapshot: Option<&amaterasu_module_sdk::foreground_context::Snapshot>,
+        now: Instant,
+    ) {
+        self.observation = snapshot
+            .filter(|value| valid_executable(&value.executable))
+            .map(|value| (value.executable.clone(), value.fullscreen, now));
     }
 
-    pub(crate) fn enabled(&self, target: &LifecycleTarget, now: Instant) -> bool {
-        let Some((observed, captured)) = &self.observation else {
+    pub(crate) fn enabled(
+        &self,
+        target: Option<&LifecycleTarget>,
+        foreground_only: bool,
+        fullscreen_only: bool,
+        now: Instant,
+    ) -> bool {
+        if !foreground_only && !fullscreen_only {
+            return true;
+        }
+        let Some((observed, fullscreen, captured)) = &self.observation else {
             return false;
         };
         if now
@@ -49,9 +62,15 @@ impl ForegroundPolicy {
         {
             return false;
         }
-        self.applications
-            .iter()
-            .any(|(candidate, executable)| candidate == target && executable == observed)
+        if fullscreen_only && *fullscreen != Some(true) {
+            return false;
+        }
+        !foreground_only
+            || target.is_some_and(|target| {
+                self.applications
+                    .iter()
+                    .any(|(candidate, executable)| candidate == target && executable == observed)
+            })
     }
 }
 
@@ -82,6 +101,32 @@ mod tests {
             client: None,
         }
     }
+    fn snapshot(fullscreen: Option<bool>) -> amaterasu_module_sdk::foreground_context::Snapshot {
+        amaterasu_module_sdk::foreground_context::Snapshot {
+            executable: "/games/one".into(),
+            fullscreen,
+        }
+    }
+    #[test]
+    fn fullscreen_requires_fresh_explicit_true_and_combines_with_identity() {
+        let mut policy = ForegroundPolicy::default();
+        let now = Instant::now();
+        assert!(policy.enabled(None, false, false, now));
+        assert!(!policy.enabled(None, false, true, now));
+        for value in [None, Some(false)] {
+            policy.observe(Some(&snapshot(value)), now);
+            assert!(!policy.enabled(None, false, true, now));
+        }
+        policy.observe(Some(&snapshot(Some(true))), now);
+        assert!(policy.enabled(None, false, true, now));
+        assert!(!policy.enabled(Some(&target("one")), true, true, now));
+        policy.set_context(&context(
+            "one",
+            json!({"kind":"application", "executable_path":"/games/one"}),
+        ));
+        assert!(policy.enabled(Some(&target("one")), true, true, now));
+        assert!(!policy.enabled(None, false, true, now + Duration::from_secs(2)));
+    }
     #[test]
     fn identity_is_target_scoped_and_missing_or_stale_fails_closed() {
         let mut policy = ForegroundPolicy::default();
@@ -94,18 +139,23 @@ mod tests {
             "two",
             json!({"kind":"application", "executable_path":"/games/two"}),
         ));
-        assert!(!policy.enabled(&target("one"), now));
-        policy.observe(Some("/games/one"), now);
-        assert!(policy.enabled(&target("one"), now));
-        assert!(!policy.enabled(&target("two"), now));
-        assert!(!policy.enabled(&target("one"), now + Duration::from_secs(2)));
+        assert!(!policy.enabled(Some(&target("one")), true, false, now));
+        policy.observe(Some(&snapshot(Some(true))), now);
+        assert!(policy.enabled(Some(&target("one")), true, false, now));
+        assert!(!policy.enabled(Some(&target("two")), true, false, now));
+        assert!(!policy.enabled(
+            Some(&target("one")),
+            true,
+            false,
+            now + Duration::from_secs(2)
+        ));
         policy.observe(None, now);
-        assert!(!policy.enabled(&target("one"), now));
+        assert!(!policy.enabled(Some(&target("one")), true, false, now));
         policy.set_context(&context(
             "one",
             json!({"kind":"desktop", "executable_path":"/games/one"}),
         ));
-        policy.observe(Some("/games/one"), now);
-        assert!(!policy.enabled(&target("one"), now));
+        policy.observe(Some(&snapshot(Some(true))), now);
+        assert!(!policy.enabled(Some(&target("one")), true, false, now));
     }
 }

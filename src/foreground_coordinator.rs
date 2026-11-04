@@ -245,10 +245,7 @@ impl Coordinator {
                         .ok()
                         .and_then(|reply| reply.snapshot);
                 if let Ok(mut state) = self.policy.lock() {
-                    state.observe(
-                        observation.as_ref().map(|value| value.executable.as_str()),
-                        now,
-                    );
+                    state.observe(observation.as_ref(), now);
                 }
             }
             Purpose::Context {

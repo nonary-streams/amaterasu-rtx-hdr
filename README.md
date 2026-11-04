@@ -101,10 +101,13 @@ the effect and fails an incompatible stream without skipping processing.
 
 ## Foreground policy
 
-`rtx_hdr_foreground_only` defaults to false. When enabled, the plugin applies
+`rtx_hdr_foreground_only` and `rtx_hdr_fullscreen_only` default to false. When
+foreground matching is enabled, the plugin applies
 TrueHDR only while the selected foreground provider reports the exact executable
 associated with the stream lifecycle target. Missing, stale, or mismatched
-observations use the SDR-in-HDR fallback. Trusted startup composition must set
+observations use the SDR-in-HDR fallback. When fullscreen-only is enabled,
+conversion additionally requires a fresh, explicitly fullscreen observation;
+unknown fullscreen state also falls back. Trusted startup composition must set
 `foreground_context_service` and grant this plugin access to the selected
 `amaterasu.foreground-context/1` implementation and to lifecycle
 `read_provider_context`. No observer is silently selected. Foreground identity
@@ -134,7 +137,7 @@ driver 615.71.09. It does not establish installed-host, encoded-stream, client
 display brightness, or Windows/NVIDIA App pixel parity.
 
 Vibeshine was used as a behavioral reference. Windows resource integration
-and fullscreen detection remain separate parity work. The live controls and peak
+and live fullscreen detection qualification remain separate parity work. The live controls and peak
 correction are independently implemented; numerical equivalence with Vibeshine
 has not been measured. This change does not install or activate the plugin in an
 existing host profile.

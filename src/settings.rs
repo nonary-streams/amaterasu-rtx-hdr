@@ -29,6 +29,9 @@ pub struct Settings {
     /// Gate conversion on the selected application being in the foreground.
     #[serde(default)]
     pub foreground_only: bool,
+    /// Gate conversion on the active window being fullscreen.
+    #[serde(default)]
+    pub fullscreen_only: bool,
     #[serde(default = "default_streams")]
     pub max_streams: usize,
     #[serde(default = "default_buffers")]
@@ -157,6 +160,8 @@ pub struct StreamSettings {
     pub rtx_hdr_sdr_brightness: u32,
     #[serde(default)]
     pub rtx_hdr_foreground_only: bool,
+    #[serde(default)]
+    pub rtx_hdr_fullscreen_only: bool,
     /// Admitted target used by this provider to resolve foreground policy.
     #[serde(default)]
     pub foreground_target: Option<amaterasu_module_sdk::extension_api::LifecycleTarget>,
@@ -178,6 +183,7 @@ impl StreamSettings {
         configured.debanding = self.rtx_hdr_debanding;
         configured.sdr_brightness = self.rtx_hdr_sdr_brightness;
         configured.foreground_only = self.rtx_hdr_foreground_only;
+        configured.fullscreen_only = self.rtx_hdr_fullscreen_only;
         configured.validate()?;
         Ok(configured)
     }
@@ -201,9 +207,12 @@ mod stream_settings_tests {
         assert_eq!(selected.runtime_directory, startup.runtime_directory);
         assert_eq!(selected.parameters(), [0, 200, 50, 1000, 0]);
         assert!(!selected.foreground_only);
+        assert!(!selected.fullscreen_only);
         assert!(controls.foreground_target.is_none());
         controls.rtx_hdr_foreground_only = true;
         assert!(controls.apply(&startup).unwrap().foreground_only);
+        controls.rtx_hdr_fullscreen_only = true;
+        assert!(controls.apply(&startup).unwrap().fullscreen_only);
         let target = serde_json::json!({"kind":"session", "host_epoch":"host", "session_id":"session", "generation":1});
         let mut with_target = serde_json::to_value(&controls).unwrap();
         with_target["foreground_target"] = target;

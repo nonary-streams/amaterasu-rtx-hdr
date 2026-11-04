@@ -79,10 +79,21 @@ fn intent_target_survives_registry_updates_and_demand_is_retired() {
         .update_stream(9, &serde_json::to_vec(&registry).unwrap())
         .unwrap();
     assert_eq!(counter.load(Ordering::Relaxed), 0);
+    registry["rtx_hdr_fullscreen_only"] = true.into();
+    processor
+        .update_stream(9, &serde_json::to_vec(&registry).unwrap())
+        .unwrap();
+    assert_eq!(counter.load(Ordering::Relaxed), 1);
     registry["rtx_hdr_foreground_only"] = true.into();
     processor
         .update_stream(9, &serde_json::to_vec(&registry).unwrap())
         .unwrap();
+    assert_eq!(counter.load(Ordering::Relaxed), 1);
+    registry["rtx_hdr_fullscreen_only"] = false.into();
+    processor
+        .update_stream(9, &serde_json::to_vec(&registry).unwrap())
+        .unwrap();
+    assert_eq!(counter.load(Ordering::Relaxed), 1);
     processor.cancel(9);
     assert_eq!(counter.load(Ordering::Relaxed), 0);
     processor

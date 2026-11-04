@@ -25,6 +25,10 @@ pub fn definitions() -> Fields {
         ("rtx_hdr_debanding", Definition::Boolean { default: true }),
         ("rtx_hdr_sdr_brightness", integer(0, 0, 100)),
         (
+            "rtx_hdr_fullscreen_only",
+            Definition::Boolean { default: false },
+        ),
+        (
             "rtx_hdr_foreground_only",
             Definition::Boolean { default: false },
         ),
@@ -69,6 +73,11 @@ pub fn descriptor() -> ExtensionDescriptor {
             "rtx_hdr_saturation",
             "Saturation",
             "Adjust color saturation of the HDR conversion.",
+        ),
+        (
+            "rtx_hdr_fullscreen_only",
+            "Only convert fullscreen video",
+            "Use SDR fallback while fullscreen state is false or unavailable.",
         ),
         (
             "rtx_hdr_foreground_only",
@@ -182,7 +191,10 @@ mod tests {
                 "{}",
                 option.id
             );
-            if option.id != "rtx_hdr_debanding" && option.id != "rtx_hdr_foreground_only" {
+            if option.id != "rtx_hdr_debanding"
+                && option.id != "rtx_hdr_foreground_only"
+                && option.id != "rtx_hdr_fullscreen_only"
+            {
                 assert_eq!(
                     option.presentation,
                     Some(OptionPresentation::Slider),

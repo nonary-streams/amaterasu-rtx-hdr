@@ -113,6 +113,24 @@
           "default": false,
           "type": "boolean"
         },
+        "help": "Use SDR fallback while fullscreen state is false or unavailable.",
+        "id": "rtx_hdr_fullscreen_only",
+        "label": "Only convert fullscreen video",
+        "presentation": null,
+        "required_capabilities": []
+      },
+      {
+        "allowed_scopes": [
+          "host",
+          "application",
+          "paired_client",
+          "session"
+        ],
+        "apply_policy": "live_action",
+        "definition": {
+          "default": false,
+          "type": "boolean"
+        },
         "help": "Use SDR fallback while the application is not in the foreground or its state is unavailable.",
         "id": "rtx_hdr_foreground_only",
         "label": "Only convert the foreground application",
