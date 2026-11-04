@@ -138,7 +138,7 @@ pub fn descriptor() -> ExtensionDescriptor {
         revision: 1,
         options,
         actions: vec![],
-        capabilities: vec![],
+        capabilities: vec![amaterasu_module_sdk::extension_api::STREAM_JOIN_CAPABILITY.into()],
         settings_validate: MethodRef {
             service: SERVICE.into(),
             method: "settings_validate".into(),

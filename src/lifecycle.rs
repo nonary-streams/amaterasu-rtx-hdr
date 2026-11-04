@@ -103,6 +103,7 @@ pub(crate) fn registrations() -> Vec<Command> {
                             ("dependency_inputs", Kind::Array),
                             ("control_results", Kind::Array),
                             ("source_video_mode", Kind::Any),
+                            ("join_context", Kind::Object),
                         ],
                     )
                 },
@@ -158,6 +159,21 @@ pub(crate) fn handle(caller: &str, selected: &Selection, payload: Value) -> Valu
     }
     if crate::settings_descriptor::validate(&request.settings).is_err() {
         return rejected("invalid_settings");
+    }
+    if request.intent == Some(extension_api::StreamIntent::Join) {
+        let response = match request.operation {
+            ProviderOperation::ResourcePlan => {
+                extension_api::stream_join_plan(&request, crate::settings_descriptor::PROVIDER)
+                    .map(|plan| ProviderResponse::Planned { plan })
+            }
+            ProviderOperation::LifecycleCallback => {
+                extension_api::stream_join_callback(&request, crate::settings_descriptor::PROVIDER)
+            }
+            _ => Err("unsupported join operation".into()),
+        };
+        return response
+            .and_then(|response| serde_json::to_value(response).map_err(|error| error.to_string()))
+            .unwrap_or_else(|_| rejected("invalid_join_context"));
     }
     let processing_requirement = if request
         .settings

@@ -1,7 +1,9 @@
 {
   "descriptor": {
     "actions": [],
-    "capabilities": [],
+    "capabilities": [
+      "amaterasu.stream/join"
+    ],
     "display_name": "RTX HDR",
     "options": [
       {
@@ -221,6 +223,7 @@
         "optional": {
           "control_results": "array",
           "dependency_inputs": "array",
+          "join_context": "object",
           "resource_generation": "integer",
           "source_video_mode": "any"
         },
@@ -270,6 +273,7 @@
         "optional": {
           "control_results": "array",
           "dependency_inputs": "array",
+          "join_context": "object",
           "resource_generation": "integer",
           "source_video_mode": "any"
         },
