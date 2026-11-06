@@ -52,7 +52,7 @@ pub fn descriptor() -> ExtensionDescriptor {
         (
             "rtx_hdr_enable",
             "Enable RTX HDR",
-            "Convert SDR video to HDR on a supported NVIDIA GPU and HDR client. Start a new application session after changing this setting.",
+            "Convert SDR video to HDR on a supported NVIDIA GPU and HDR client. Toggle conversion live within an HDR stream; disabled conversion retains SDR appearance in the same HDR output.",
         ),
         (
             "rtx_hdr_peak_brightness",
@@ -106,28 +106,13 @@ pub fn descriptor() -> ExtensionDescriptor {
                 Definition::Integer { .. } => Some(OptionPresentation::Slider),
                 _ => None,
             },
-            allowed_scopes: if id == "rtx_hdr_enable" {
-                // Enablement selects the source range during session prepare;
-                // a live session override cannot be applied to that session and
-                // its identity is not reused by the next session.
-                vec![
-                    SettingScope::Host,
-                    SettingScope::Application,
-                    SettingScope::PairedClient,
-                ]
-            } else {
-                vec![
-                    SettingScope::Host,
-                    SettingScope::Application,
-                    SettingScope::PairedClient,
-                    SettingScope::Session,
-                ]
-            },
-            apply_policy: if id == "rtx_hdr_enable" {
-                ApplyPolicy::NextSession
-            } else {
-                ApplyPolicy::LiveAction
-            },
+            allowed_scopes: vec![
+                SettingScope::Host,
+                SettingScope::Application,
+                SettingScope::PairedClient,
+                SettingScope::Session,
+            ],
+            apply_policy: ApplyPolicy::LiveAction,
             required_capabilities: vec![],
             choice_labels: Default::default(),
         })
@@ -135,7 +120,7 @@ pub fn descriptor() -> ExtensionDescriptor {
     ExtensionDescriptor {
         provider: PROVIDER.into(),
         display_name: Some("RTX HDR".into()),
-        revision: 1,
+        revision: 2,
         options,
         actions: vec![],
         capabilities: vec![amaterasu_module_sdk::extension_api::STREAM_JOIN_CAPABILITY.into()],
@@ -177,8 +162,8 @@ mod tests {
             .iter()
             .find(|option| option.id == "rtx_hdr_enable")
             .unwrap();
-        assert_eq!(enable.apply_policy, ApplyPolicy::NextSession);
-        assert!(!enable.allowed_scopes.contains(&SettingScope::Session));
+        assert_eq!(enable.apply_policy, ApplyPolicy::LiveAction);
+        assert!(enable.allowed_scopes.contains(&SettingScope::Session));
         assert!(enable.allowed_scopes.contains(&SettingScope::PairedClient));
         for option in descriptor
             .options

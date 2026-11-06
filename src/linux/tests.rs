@@ -212,6 +212,51 @@ fn stream_controls_update_atomically_and_retire_with_stream() {
     processor.configure_stream(10, json).unwrap();
     processor.cancel(10);
 }
+
+#[test]
+fn sdk_toggle_preserves_scope_metadata_and_atomic_rejection() {
+    let (mut controls, _) = intent_settings();
+    controls["rtx_hdr_enable"] = false.into();
+    let mut processor = Processor::new(settings());
+    processor
+        .configure_stream(77, &serde_json::to_vec(&controls).unwrap())
+        .unwrap();
+    assert!(!processor.stream_settings[&77].enabled);
+    let metadata = processor.hdr_metadata(77).unwrap();
+    let target = processor.targets[&77].clone();
+    let raw = into_gpu_binding(processor);
+    // SAFETY: the SDK owns this live binding until its explicit release below.
+    let api = unsafe { &*raw };
+    for enabled in [true, false, true] {
+        controls["rtx_hdr_enable"] = enabled.into();
+        assert_eq!(
+            unsafe { update_gpu_stream(api, 77, &serde_json::to_vec(&controls).unwrap()) },
+            Ok(())
+        );
+        let mut invalid = controls.clone();
+        invalid["rtx_hdr_enable"] = (!enabled).into();
+        invalid["rtx_hdr_peak_brightness"] = 2001.into();
+        assert_eq!(
+            unsafe { update_gpu_stream(api, 77, &serde_json::to_vec(&invalid).unwrap()) },
+            Err(STATUS_INVALID_ARGUMENT)
+        );
+    }
+    // Metadata remains HDR even while conversion is disabled; target ownership
+    // cannot be replaced by a settings update.
+    let mut hijack = controls.clone();
+    hijack["foreground_target"]["generation"] = 2.into();
+    assert!(unsafe { update_gpu_stream(api, 77, &serde_json::to_vec(&hijack).unwrap()) }.is_err());
+    assert!(target.is_some());
+    assert_eq!(metadata.enabled, 1);
+    unsafe {
+        (api.cancel_dmabuf_leases)(api.base.context, 77);
+        assert_eq!(
+            update_gpu_stream(api, 77, &serde_json::to_vec(&controls).unwrap()),
+            Err(MEDIA_CLOSED)
+        );
+        api.base.release.unwrap()(api.base.context);
+    }
+}
 unsafe extern "C" fn input_retain(_: *mut c_void) -> Status {
     STATUS_OK
 }
@@ -288,6 +333,86 @@ fn read(lease: &DmaBufFrameLease) -> Vec<u32> {
 fn nits(code: u32) -> f64 {
     let p = (f64::from(code) / 1023.0).powf(32.0 / 2523.0);
     10000.0 * ((p - 0.8359375).max(0.0) / (18.8515625 - 18.6875 * p)).powf(16384.0 / 2610.0)
+}
+
+#[test]
+#[ignore = "requires an NVIDIA RTX GPU and AMATERASU_TRUEHDR_RUNTIME pointing to the licensed VFX runtime"]
+fn nvidia_sdk_toggle_from_disabled_preserves_frames_and_hdr_output() {
+    let mut config = settings();
+    config.runtime_directory = std::env::var_os("AMATERASU_TRUEHDR_RUNTIME")
+        .expect("runtime path")
+        .into();
+    config.output_buffers = 2;
+    let stream = Stream::open(&config, 512, 288, None).unwrap();
+    let source = Source::new(stream.slots[0].session.clone());
+    let mut processor = Processor::new(config);
+    let (mut controls, _) = intent_settings();
+    controls["rtx_hdr_enable"] = false.into();
+    processor
+        .configure_stream(77, &serde_json::to_vec(&controls).unwrap())
+        .unwrap();
+    let metadata = processor.hdr_metadata(77).unwrap();
+    let raw = into_gpu_binding(processor);
+    // SAFETY: this test retains the SDK-owned binding and its input source until
+    // all output references have been released and cancellation has completed.
+    let api = unsafe { &*raw };
+    let input = source.lease();
+    let mut held = None;
+    let mut fallback = Vec::new();
+    assert_eq!(
+        unsafe {
+            process_gpu(api, 77, &input, CAPTURE_FRAME_FRESH, |output| {
+                assert_eq!(output.frame.color, DMABUF_COLOR_BT2020_PQ);
+                fallback = read(output);
+                assert_eq!(output.retain.unwrap()(output.context), STATUS_OK);
+                held = Some(*output);
+                STATUS_OK
+            })
+        },
+        ProcessingOutcome::Accepted
+    );
+    let held = held.unwrap();
+    assert!((nits(fallback[300] & 1023) - 100.0).abs() < 3.0);
+    for enabled in [true, false, true, false] {
+        controls["rtx_hdr_enable"] = enabled.into();
+        assert_eq!(
+            unsafe { update_gpu_stream(api, 77, &serde_json::to_vec(&controls).unwrap()) },
+            Ok(())
+        );
+        let mut pixels = Vec::new();
+        assert_eq!(
+            unsafe {
+                process_gpu(api, 77, &input, CAPTURE_FRAME_FRESH, |output| {
+                    assert_eq!(output.frame.color, held.frame.color);
+                    assert_eq!(output.frame.fourcc, held.frame.fourcc);
+                    assert_eq!(output.frame.sequence, input.frame.sequence);
+                    pixels = read(output);
+                    STATUS_OK
+                })
+            },
+            ProcessingOutcome::Accepted
+        );
+        let white = nits(pixels[300] & 1023);
+        if enabled {
+            assert!(white > 900.0, "conversion white: {white}");
+        } else {
+            assert_eq!(pixels, fallback);
+        }
+        assert_eq!(read(&held), fallback, "toggle changed a retained frame");
+        let mut observed = metadata;
+        let v1_1 = unsafe { &*raw.cast::<amaterasu_media::GpuProcessorApiV1_1>() };
+        assert_eq!(
+            unsafe { (v1_1.hdr_metadata)(api.base.context, 77, &mut observed) },
+            STATUS_OK
+        );
+        assert_eq!(observed.fields, metadata.fields);
+        assert_eq!(observed.enabled, metadata.enabled);
+    }
+    unsafe {
+        held.release.unwrap()(held.context, -1);
+        (api.cancel_dmabuf_leases)(api.base.context, 77);
+        api.base.release.unwrap()(api.base.context);
+    }
 }
 
 #[test]

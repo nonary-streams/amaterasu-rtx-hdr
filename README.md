@@ -144,3 +144,33 @@ existing host profile.
 
 References: [NVIDIA TrueHDR filter](https://docs.nvidia.com/maxine/vfx/latest/Filters/TrueHDR.html),
 [Processing SDK](../../docs/gpu-processing-sdk.md).
+
+## Application settings UI
+
+`ui/application.js` is the plugin-owned application editor UI. It registers an
+application section, renders the RTX HDR controls through the shared browser UI
+SDK, and saves through the application-scoped settings helper. Slider edits are
+debounced and saved serially; changes made during a pending save remain queued.
+Inheritance removes only the app-specific value. Enablement and tuning use the
+live-settings contract. HDR streams using this provider reserve the
+SDR-to-HDR processing path even when conversion starts disabled: turning the
+effect off uses SDR fallback in the same HDR output, and turning it back on
+restores conversion without restarting capture or encoding. Ordinary SDR
+streams keep their negotiated format; changing the output format still needs
+a new stream.
+
+Package this separately signed UI with `ui/application-ui.json`. Copy only
+`application.js` into the publisher's source-assets directory, then run:
+
+```text
+amaterasu-web-extension pack SOURCE OUTPUT rtx-hdr "RTX HDR" application.js SEQUENCE EXPIRES_UNIX SECRET_HEX_FILE ui/application-ui.json
+```
+
+The configuration declares `placements: ["application"]` and
+`settings_provider: "amaterasu.rtx-hdr"`. The host supplies the section and fixed
+application scope; it does not contain the RTX HDR form implementation. Selecting
+this signed UI replaces the host's generic settings form for this provider.
+Other plugins may attach application UI without declaring a settings provider.
+The existing settings registry validates values and permissions; the UI helper
+does not grant access. Building the native module alone does not select this
+separately approved browser UI.

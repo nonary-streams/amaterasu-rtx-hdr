@@ -10,14 +10,15 @@
         "allowed_scopes": [
           "host",
           "application",
-          "paired_client"
+          "paired_client",
+          "session"
         ],
-        "apply_policy": "next_session",
+        "apply_policy": "live_action",
         "definition": {
           "default": false,
           "type": "boolean"
         },
-        "help": "Convert SDR video to HDR on a supported NVIDIA GPU and HDR client. Start a new application session after changing this setting.",
+        "help": "Convert SDR video to HDR on a supported NVIDIA GPU and HDR client. Toggle conversion live within an HDR stream; disabled conversion retains SDR appearance in the same HDR output.",
         "id": "rtx_hdr_enable",
         "label": "Enable RTX HDR",
         "presentation": null,
@@ -179,7 +180,7 @@
       }
     ],
     "provider": "amaterasu.rtx-hdr",
-    "revision": 1,
+    "revision": 2,
     "settings_validate": {
       "interface_major": 1,
       "interface_minor": 0,
@@ -346,12 +347,14 @@
     },
     {
       "interface_major": 1,
-      "interface_minor": 0,
+      "interface_minor": 1,
       "method": "processing_intent",
       "privilege": "user",
       "request": {
         "allow_extra": false,
-        "optional": {},
+        "optional": {
+          "output_hdr": "boolean"
+        },
         "required": {
           "revision": "string",
           "settings": "object",

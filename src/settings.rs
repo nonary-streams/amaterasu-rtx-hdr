@@ -11,6 +11,9 @@ pub struct Settings {
     /// Require the host-installed, hash-verified NVIDIA runtime inventory.
     #[serde(default)]
     pub require_verified_runtime: bool,
+    /// Per-stream conversion switch. False retains the HDR-compatible SDR path.
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
     #[serde(default)]
     pub device: u32,
     #[serde(default = "default_contrast")]
@@ -36,6 +39,9 @@ pub struct Settings {
     pub max_streams: usize,
     #[serde(default = "default_buffers")]
     pub output_buffers: usize,
+}
+fn default_enabled() -> bool {
+    true
 }
 fn default_contrast() -> u32 {
     100
@@ -144,8 +150,8 @@ mod tests {
     }
 }
 
-/// Provider-owned controls for a single stream. Enablement is selected at
-/// admission; tuning may be updated while the stream is active. Runtime path
+/// Provider-owned controls for a single stream. Conversion and tuning may be
+/// updated while the HDR-compatible stream is active. Runtime path
 /// and GPU allocation limits remain trusted startup configuration.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -169,13 +175,13 @@ pub struct StreamSettings {
 
 impl StreamSettings {
     pub fn apply(&self, startup: &Settings) -> Result<Settings, &'static str> {
-        if !self.rtx_hdr_enable
-            || !(-100..=100).contains(&self.rtx_hdr_contrast)
+        if !(-100..=100).contains(&self.rtx_hdr_contrast)
             || !(-100..=100).contains(&self.rtx_hdr_saturation)
         {
             return Err("invalid RTX HDR stream settings");
         }
         let mut configured = startup.clone();
+        configured.enabled = self.rtx_hdr_enable;
         configured.contrast = (self.rtx_hdr_contrast + 100) as u32;
         configured.saturation = (self.rtx_hdr_saturation + 100) as u32;
         configured.middle_gray = self.rtx_hdr_middle_gray;
@@ -230,7 +236,7 @@ mod stream_settings_tests {
         controls.rtx_hdr_sdr_brightness = 100;
         assert_eq!(controls.apply(&startup).unwrap().sdr_brightness, 100);
         controls.rtx_hdr_enable = false;
-        assert!(controls.apply(&startup).is_err());
+        assert!(!controls.apply(&startup).unwrap().enabled);
         assert!(
             serde_json::from_value::<StreamSettings>(
                 serde_json::json!({"runtime_directory":"/untrusted"})

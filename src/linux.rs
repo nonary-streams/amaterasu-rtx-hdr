@@ -365,7 +365,10 @@ impl GpuFrameProcessor for Processor {
             .apply(&self.settings)
             .map_err(|_| STATUS_INVALID_ARGUMENT)?;
         self.targets.insert(stream, controls.foreground_target);
-        self.set_demand(stream, settings.foreground_only || settings.fullscreen_only);
+        self.set_demand(
+            stream,
+            settings.enabled && (settings.foreground_only || settings.fullscreen_only),
+        );
         self.stream_settings.insert(stream, settings);
         Ok(())
     }
@@ -389,10 +392,18 @@ impl GpuFrameProcessor for Processor {
         {
             return Err(STATUS_INVALID_ARGUMENT);
         }
-        if let Some(active) = self.streams.get(&stream) {
-            active.configure(&settings, active.enabled, self.logger.as_ref())?;
+        if let Some(active) = self.streams.get_mut(&stream) {
+            // Turning on a gated effect waits for the next foreground check;
+            // turning it off takes effect immediately without reallocating.
+            let enabled = settings.enabled
+                && (active.enabled || (!settings.foreground_only && !settings.fullscreen_only));
+            active.configure(&settings, enabled, self.logger.as_ref())?;
+            active.enabled = enabled;
         }
-        self.set_demand(stream, settings.foreground_only || settings.fullscreen_only);
+        self.set_demand(
+            stream,
+            settings.enabled && (settings.foreground_only || settings.fullscreen_only),
+        );
         self.stream_settings.insert(stream, settings);
         Ok(())
     }
@@ -421,24 +432,26 @@ impl GpuFrameProcessor for Processor {
         if !self.stream_settings.contains_key(&stream) {
             self.set_demand(
                 stream,
-                self.settings.foreground_only || self.settings.fullscreen_only,
+                self.settings.enabled
+                    && (self.settings.foreground_only || self.settings.fullscreen_only),
             );
         }
         let settings = self.stream_settings.get(&stream).unwrap_or(&self.settings);
-        let enabled = if !settings.foreground_only && !settings.fullscreen_only {
-            true
-        } else {
-            self.policy.as_ref().is_some_and(|policy| {
-                policy.lock().ok().is_some_and(|policy| {
-                    policy.enabled(
-                        self.targets.get(&stream).and_then(Option::as_ref),
-                        settings.foreground_only,
-                        settings.fullscreen_only,
-                        std::time::Instant::now(),
-                    )
+        let enabled = settings.enabled
+            && if !settings.foreground_only && !settings.fullscreen_only {
+                true
+            } else {
+                self.policy.as_ref().is_some_and(|policy| {
+                    policy.lock().ok().is_some_and(|policy| {
+                        policy.enabled(
+                            self.targets.get(&stream).and_then(Option::as_ref),
+                            settings.foreground_only,
+                            settings.fullscreen_only,
+                            std::time::Instant::now(),
+                        )
+                    })
                 })
-            })
-        };
+            };
         let active = self.streams.get_mut(&stream).expect("stream was opened");
         if active.enabled != enabled {
             active.configure(settings, enabled, self.logger.as_ref())?;

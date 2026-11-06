@@ -176,10 +176,14 @@ pub(crate) fn handle(caller: &str, selected: &Selection, payload: Value) -> Valu
             .unwrap_or_else(|_| rejected("invalid_join_context"));
     }
     let processing_requirement = if request
-        .settings
-        .get("rtx_hdr_enable")
-        .and_then(Value::as_bool)
-        == Some(true)
+        .requested_video
+        .as_ref()
+        .is_some_and(|video| video.hdr)
+        || request
+            .settings
+            .get("rtx_hdr_enable")
+            .and_then(Value::as_bool)
+            == Some(true)
     {
         json!({"source_hdr_required":false, "output_hdr_required":true})
     } else {
@@ -235,14 +239,14 @@ pub(crate) fn intent_registration() -> Command {
             service: crate::settings_descriptor::SERVICE.into(),
             method: "processing_intent".into(),
             interface_major: 1,
-            interface_minor: 0,
+            interface_minor: 1,
             request: schema(
                 &[
                     ("target", Kind::Object),
                     ("revision", Kind::String),
                     ("settings", Kind::Object),
                 ],
-                &[],
+                &[("output_hdr", Kind::Boolean)],
             ),
             response: schema(
                 &[("status", Kind::String)],
@@ -270,16 +274,22 @@ pub(crate) fn intent(caller: &str, allowed: &[String], payload: Value) -> Value 
     let Some(envelope) = payload.as_object().filter(|object| object.len() == 4) else {
         return reject("invalid_request");
     };
+    let minor = envelope.get("interface_minor").and_then(Value::as_u64);
     if envelope.get("method") != Some(&json!("processing_intent"))
         || envelope.get("interface_major") != Some(&json!(1))
-        || envelope.get("interface_minor") != Some(&json!(0))
+        || !matches!(minor, Some(0 | 1))
     {
         return reject("invalid_request");
     }
     let Some(args) = envelope
         .get("arguments")
         .and_then(Value::as_object)
-        .filter(|object| object.len() == 3)
+        .filter(|object| {
+            object.len() == 3
+                || (minor == Some(1)
+                    && object.len() == 4
+                    && object.get("output_hdr").is_some_and(Value::is_boolean))
+        })
     else {
         return reject("invalid_request");
     };
@@ -310,14 +320,17 @@ pub(crate) fn intent(caller: &str, allowed: &[String], payload: Value) -> Value 
     let Some(enabled) = settings.get("rtx_hdr_enable").and_then(Value::as_bool) else {
         return reject("invalid_settings");
     };
+    // Pipeline participation is distinct from effect enablement. An HDR stream
+    // keeps an SDR source and stable HDR output even when conversion starts off.
+    let prepared = enabled || args.get("output_hdr").and_then(Value::as_bool) == Some(true);
     let mut processor_settings = settings.clone();
     if let Some(object) = processor_settings.as_object_mut() {
         object.insert("foreground_target".into(), target.clone());
     }
     json!({"status":"succeeded", "target":target, "revision":revision,
-        "enabled":enabled,
-        "source_hdr_required":if enabled { Some(false) } else { None },
-        "output_hdr_required":if enabled { Some(true) } else { None },
+        "enabled":prepared,
+        "source_hdr_required":if prepared { Some(false) } else { None },
+        "output_hdr_required":if prepared { Some(true) } else { None },
         "processor_settings":processor_settings, "processor_service":crate::SERVICE})
 }
 
@@ -379,6 +392,36 @@ mod tests {
             "invalid_request"
         );
     }
+    #[test]
+    fn hdr_intent_reserves_processing_while_conversion_starts_disabled() {
+        let settings =
+            amaterasu_configuration_schema::defaults(&crate::settings_descriptor::definitions())
+                .unwrap();
+        let target = json!({"kind":"stream","host_epoch":"epoch","session_id":"session","stream_id":"stream","generation":1});
+        for output_hdr in [false, true] {
+            let request = json!({"method":"processing_intent","interface_major":1,"interface_minor":1,"arguments":{
+                "target":target,"revision":"snapshot","settings":settings,"output_hdr":output_hdr
+            }});
+            let result = intent("consumer", &["consumer".into()], request);
+            assert_eq!(result["status"], "succeeded");
+            assert_eq!(result["enabled"], output_hdr);
+            assert_eq!(result["processor_settings"]["rtx_hdr_enable"], false);
+            assert_eq!(result["processor_settings"]["foreground_target"], target);
+            assert_eq!(
+                result["source_hdr_required"],
+                if output_hdr {
+                    json!(false)
+                } else {
+                    Value::Null
+                }
+            );
+            assert_eq!(
+                result["output_hdr_required"],
+                if output_hdr { json!(true) } else { Value::Null }
+            );
+        }
+    }
+
     #[test]
     fn intent_translates_frozen_settings_only_for_selected_consumers() {
         let settings =
