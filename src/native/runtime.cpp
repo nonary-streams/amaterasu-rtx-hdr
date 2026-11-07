@@ -63,6 +63,14 @@ std::shared_ptr<Api> Api::load(const std::string &root) {
     CUDA_MEMBER(record_event, "cuEventRecord");
     CUDA_MEMBER(query_event, "cuEventQuery");
     CUDA_MEMBER(elapsed_time, "cuEventElapsedTime_v2");
+    CUDA_MEMBER(device_uuid, "cuDeviceGetUuid_v2");
+    CUDA_MEMBER(load_module, "cuModuleLoadData");
+    CUDA_MEMBER(unload_module, "cuModuleUnload");
+    CUDA_MEMBER(module_function, "cuModuleGetFunction");
+    CUDA_MEMBER(launch, "cuLaunchKernel");
+    CUDA_MEMBER(allocate_pitch, "cuMemAllocPitch_v2");
+    CUDA_MEMBER(free_memory, "cuMemFree_v2");
+    CUDA_MEMBER(wait_event, "cuStreamWaitEvent");
 #undef CUDA_MEMBER
     // Keep NVIDIA's wheel layout. Resolve its private shared-library dependency
     // graph in bounded passes; do not change process environment/search paths.

@@ -50,6 +50,14 @@ struct Api {
     decltype(&cuEventRecord) record_event;
     decltype(&cuEventQuery) query_event;
     decltype(&cuEventElapsedTime) elapsed_time;
+    decltype(&cuDeviceGetUuid) device_uuid;
+    decltype(&cuModuleLoadData) load_module;
+    decltype(&cuModuleUnload) unload_module;
+    decltype(&cuModuleGetFunction) module_function;
+    decltype(&cuLaunchKernel) launch;
+    decltype(&cuMemAllocPitch) allocate_pitch;
+    decltype(&cuMemFree) free_memory;
+    decltype(&cuStreamWaitEvent) wait_event;
     int (*allocate)(Image *, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned);
     void (*deallocate)(Image *);
     int (*create_effect)(const char *, void **);
@@ -158,6 +166,14 @@ struct Output {
     void close(Surface &surface);
 };
 
+/* One CUDA output slot: pitch-linear X2B10G10R10 memory in the primary
+ * context and the event recorded after each write into it. */
+struct CudaOutput {
+    CUdeviceptr pixels = 0;
+    size_t pitch = 0;
+    CUevent ready = nullptr;
+};
+
 struct Session {
     std::shared_ptr<Api> api;
     CUdevice device = 0;
@@ -169,6 +185,8 @@ struct Session {
     CUgraphicsResource input_resource = nullptr, output_resource = nullptr;
     bool retained_context = false;
     Timing timing;
+    CUmodule kernels = nullptr;
+    CUfunction pq_output = nullptr, sdr_output = nullptr;
     bool enabled = true;
     uint32_t sdr_brightness = 0;
     std::array<uint32_t, 5> parameters{};
@@ -177,6 +195,11 @@ struct Session {
     ~Session();
     int run(const AmaterasuDmaBufFrame &frame, Output &destination);
     void convert();
+    void copy_input();
+    void load_kernels();
+    void write_output(CudaOutput &destination);
+    void convert_to_cuda(CudaOutput &destination);
+    int run_cuda(const AmaterasuDmaBufFrame &frame, CudaOutput &destination);
     void configure(const uint32_t *values, bool active, uint32_t brightness);
     void *create_configured_effect(const uint32_t *values);
     void close();
@@ -193,4 +216,8 @@ int am_rtx_configure(void *, const uint32_t *, bool, uint32_t, char *, size_t);
 int am_rtx_wait_fence(int);
 int am_rtx_context_priority(void *);
 void am_rtx_take_timing(void *, rtx::TimingTotals *);
+int am_rtx_device_uuid(const char *, int, uint8_t *, char *, size_t);
+void *am_rtx_cuda_output_open(void *, uint64_t *, uint32_t *, void **, char *, size_t);
+void am_rtx_cuda_output_close(void *, void *);
+int am_rtx_process_cuda(void *, const AmaterasuDmaBufFrame *, void *, int *, char *, size_t);
 }

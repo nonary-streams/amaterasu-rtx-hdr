@@ -338,6 +338,13 @@ unsafe extern "C" {
     ) -> i32;
     fn am_rtx_test_read_vendor(context: *mut c_void, pixels: *mut u32, length: usize) -> i32;
     fn am_rtx_test_fence(context: *mut c_void) -> i32;
+    fn am_rtx_test_read_cuda(
+        context: *mut c_void,
+        pointer: u64,
+        pitch: u32,
+        pixels: *mut u32,
+        length: usize,
+    ) -> i32;
 }
 struct Source {
     session: Rc<NativeSession>,
@@ -1278,6 +1285,156 @@ fn nvidia_reports_gpu_stage_timing_without_waiting() {
     assert!(timing.total_us >= timing.sample_us + timing.output_us);
     drop(source);
     drop(session);
+    unsafe {
+        (api.cancel_dmabuf_leases)(api.base.context, 77);
+        api.base.release.unwrap()(api.base.context);
+    }
+}
+
+unsafe extern "C" fn collect_offer(
+    context: *mut c_void,
+    offer: *const CaptureResourceOffer,
+) -> Status {
+    let offers = unsafe { &mut *context.cast::<Vec<(u64, u32)>>() };
+    let offer = unsafe { &*offer };
+    offers.push((offer.id, offer.resource.kind));
+    STATUS_OK
+}
+
+/// Retains the delivered resource frame so the test can read it after return.
+unsafe extern "C" fn hold_resource(
+    context: *mut c_void,
+    frame: *const CaptureResourceFrame,
+) -> Status {
+    let held = unsafe { &mut *context.cast::<Option<CaptureResourceFrame>>() };
+    let frame = unsafe { &*frame };
+    assert_eq!(unsafe { (frame.retain)(frame.context) }, STATUS_OK);
+    *held = Some(*frame);
+    STATUS_OK
+}
+
+fn release_resource(frame: &CaptureResourceFrame) {
+    let none = FrameDescriptor {
+        kind: FRAME_SYNC_NONE,
+        version: 0,
+        size: 0,
+        reserved: 0,
+        namespace: [0; 16],
+        data: std::ptr::null(),
+    };
+    unsafe { (frame.release)(frame.context, &none) };
+}
+
+/// Largest per-channel difference between two packed X2B10G10R10 images.
+fn largest_channel_difference(left: &[u32], right: &[u32]) -> u32 {
+    left.iter()
+        .zip(right)
+        .flat_map(|(a, b)| {
+            (0..3).map(move |channel| {
+                let shift = channel * 10;
+                ((a >> shift) & 1023).abs_diff((b >> shift) & 1023)
+            })
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+#[test]
+#[ignore = "requires an NVIDIA RTX GPU and AMATERASU_TRUEHDR_RUNTIME"]
+fn nvidia_cuda_output_matches_the_gl_output() {
+    use amaterasu_module_sdk::processing::resource_output_table;
+    let mut config = settings();
+    config.runtime_directory = std::env::var_os("AMATERASU_TRUEHDR_RUNTIME")
+        .expect("runtime path")
+        .into();
+    let stream = Stream::open(&config, 512, 288, None).unwrap();
+    let session = stream.slots[0].session.clone();
+    let source = Source::new(session.clone());
+    let mut processor = Processor::new(config.clone());
+    let (controls, _) = intent_settings();
+    processor
+        .configure_stream(77, &serde_json::to_vec(&controls).unwrap())
+        .unwrap();
+    processor.streams.insert(77, stream);
+    let raw = into_gpu_binding(processor);
+    let api = unsafe { &*raw };
+    let table = unsafe { resource_output_table(api) }.expect("v1.4 resource output tail");
+    let mut offers = Vec::new();
+    let mut generation = 0;
+    let status = unsafe {
+        (table.enumerate_outputs)(
+            api.base.context,
+            77,
+            CaptureResourceOfferSink {
+                context: (&mut offers as *mut Vec<(u64, u32)>).cast(),
+                write: collect_offer,
+            },
+            &mut generation,
+        )
+    };
+    assert_eq!(status, STATUS_OK);
+    assert_eq!(offers, vec![(1u64, FRAME_RESOURCE_CUDA_DEVICE)]);
+    assert_eq!(
+        unsafe { (table.select_output)(api.base.context, 77, generation, 1) },
+        STATUS_OK
+    );
+    for (sequence, (enabled, peak)) in [(true, 1424), (true, 1000), (false, 1000)]
+        .into_iter()
+        .enumerate()
+    {
+        let mut tuned = controls.clone();
+        tuned["rtx_hdr_enable"] = enabled.into();
+        tuned["rtx_hdr_peak_brightness"] = peak.into();
+        unsafe { update_gpu_stream(api, 77, &serde_json::to_vec(&tuned).unwrap()) }.unwrap();
+        let mut lease = source.lease();
+        lease.frame.sequence = 10 + sequence as u64 * 2;
+        let mut gl = Vec::new();
+        let outcome = unsafe {
+            process_gpu(api, 77, &lease, CAPTURE_FRAME_FRESH, |output| {
+                gl = read(output);
+                STATUS_OK
+            })
+        };
+        assert_eq!(outcome, ProcessingOutcome::Accepted);
+        lease.frame.sequence += 1;
+        let mut held: Option<CaptureResourceFrame> = None;
+        let status = unsafe {
+            (table.process_to_resource)(
+                api.base.context,
+                77,
+                &lease,
+                CAPTURE_FRAME_FRESH,
+                CaptureResourceFrameSink {
+                    context: (&mut held as *mut Option<CaptureResourceFrame>).cast(),
+                    write: hold_resource,
+                },
+            )
+        };
+        assert_eq!(status, STATUS_OK);
+        let frame = held.expect("one resource frame");
+        assert_eq!(frame.sequence, lease.frame.sequence);
+        assert_eq!(frame.color.transfer, FRAME_TRANSFER_PQ);
+        let cuda = unsafe { cuda_device_frame(&frame.resource) }.expect("CUDA frame payload");
+        assert!(unsafe { cuda_event_sync(&frame.acquire_sync) }.is_some());
+        let mut pixels = vec![0u32; gl.len()];
+        assert_eq!(
+            unsafe {
+                am_rtx_test_read_cuda(
+                    session.0.as_ptr(),
+                    cuda.device_pointer,
+                    cuda.pitch,
+                    pixels.as_mut_ptr(),
+                    pixels.len(),
+                )
+            },
+            0
+        );
+        let difference = largest_channel_difference(&gl, &pixels);
+        eprintln!("enabled={enabled} peak={peak}: largest code difference {difference}");
+        // The kernels evaluate the same formulas and rounding as the shaders.
+        assert_eq!(difference, 0, "CUDA output diverges by {difference} codes");
+        release_resource(&frame);
+    }
     unsafe {
         (api.cancel_dmabuf_leases)(api.base.context, 77);
         api.base.release.unwrap()(api.base.context);

@@ -6,7 +6,9 @@ use crate::Settings;
 use amaterasu_media::*;
 use amaterasu_module_sdk::{
     abi::*,
-    processing::{GpuFrame, GpuFrameProcessor, GpuOutputFrame, RetainedGpuInput},
+    processing::{
+        GpuFrame, GpuFrameProcessor, GpuOutputFrame, ResourceOutputFrame, RetainedGpuInput,
+    },
 };
 use std::os::unix::ffi::OsStrExt;
 use std::{
@@ -117,6 +119,9 @@ impl Drop for Slot {
 }
 struct Stream {
     slots: Vec<Rc<Slot>>,
+    /// CUDA output slots, allocated on the first resource-handoff frame.
+    cuda_slots: Vec<Rc<resource::CudaSlot>>,
+    cached_resource: Option<resource::CachedResource>,
     timing_reported: std::time::Instant,
     cached: Option<CachedOutput>,
     pending_inputs: VecDeque<PendingInput>,
@@ -330,6 +335,8 @@ impl Stream {
         report_context_priority(&session, logger);
         Ok(Self {
             slots,
+            cuda_slots: Vec::new(),
+            cached_resource: None,
             timing_reported: std::time::Instant::now(),
             cached: None,
             pending_inputs: VecDeque::new(),
@@ -565,7 +572,9 @@ impl Stream {
     fn assert_retired(&self) {
         // Video cancels downstream encoders before this stage. A reference here
         // means that barrier failed: do not unload a provider with live storage.
-        if self.slots.iter().any(|slot| slot.busy.get()) {
+        if self.slots.iter().any(|slot| slot.busy.get())
+            || self.cuda_slots.iter().any(|slot| slot.is_referenced())
+        {
             std::process::abort();
         }
     }
@@ -581,6 +590,9 @@ pub(crate) struct Processor {
     streams: BTreeMap<u64, Stream>,
     retired: BTreeSet<u64>,
     logger: Option<amaterasu_module_sdk::LogEmitter>,
+    /// Negotiated resource outputs per configured stream.
+    resource_outputs: BTreeMap<u64, resource::ResourceOutput>,
+    device_uuid: Option<[u8; 16]>,
 }
 impl Processor {
     pub fn new(settings: Settings) -> Self {
@@ -594,6 +606,8 @@ impl Processor {
             streams: BTreeMap::new(),
             retired: BTreeSet::new(),
             logger: None,
+            resource_outputs: BTreeMap::new(),
+            device_uuid: None,
         }
     }
     pub fn with_policy(
@@ -630,6 +644,109 @@ impl Processor {
     pub fn with_logger(mut self, logger: amaterasu_module_sdk::LogEmitter) -> Self {
         self.logger = Some(logger);
         self
+    }
+
+    /// Opens the stream on its first frame and applies the current
+    /// enablement. Returns whether conversion is active for this frame.
+    fn prepare(&mut self, stream: u64, frame: &DmaBufFrame) -> Result<bool, Status> {
+        if self.retired.contains(&stream) {
+            return Err(MEDIA_CLOSED);
+        }
+        if !supported_input(frame) {
+            if let Some(logger) = &self.logger {
+                let message = serde_json::json!({
+                    "event": "rtx_hdr_input_rejected",
+                    "stream": stream,
+                    "width": frame.width,
+                    "height": frame.height,
+                    "color": frame.color,
+                    "fourcc": frame.fourcc,
+                    "planes": frame.plane_count,
+                    "pitch": frame.planes[0].pitch,
+                    "offset": frame.planes[0].offset,
+                })
+                .to_string();
+                let _ = logger.emit(amaterasu_module_sdk::LogLevel::Error, "rtx-hdr", &message);
+            }
+            return Err(MEDIA_UNSUPPORTED);
+        }
+        if !self.streams.contains_key(&stream) {
+            if self.streams.len() >= self.settings.max_streams || self.retired.len() >= 1024 {
+                return Err(MEDIA_BUSY);
+            }
+            self.streams.insert(
+                stream,
+                Stream::open(
+                    self.stream_settings.get(&stream).unwrap_or(&self.settings),
+                    frame.width,
+                    frame.height,
+                    self.logger.as_ref(),
+                )?,
+            );
+        }
+        if !self.stream_settings.contains_key(&stream) {
+            self.set_demand(
+                stream,
+                self.settings.enabled
+                    && (self.settings.foreground_only || self.settings.fullscreen_only),
+            );
+        }
+        let settings = self.stream_settings.get(&stream).unwrap_or(&self.settings);
+        let enabled = settings.enabled
+            && if !settings.foreground_only && !settings.fullscreen_only {
+                true
+            } else {
+                self.policy.as_ref().is_some_and(|policy| {
+                    policy.lock().ok().is_some_and(|policy| {
+                        policy.enabled(
+                            self.targets.get(&stream).and_then(Option::as_ref),
+                            settings.foreground_only,
+                            settings.fullscreen_only,
+                            std::time::Instant::now(),
+                        )
+                    })
+                })
+            };
+        let active = self.streams.get_mut(&stream).expect("stream was opened");
+        if active.enabled != enabled {
+            active.configure(settings, enabled, self.logger.as_ref())?;
+            active.enabled = enabled;
+        }
+        Ok(enabled)
+    }
+
+    fn report_conversion(&mut self, stream: u64, frame: &DmaBufFrame, enabled: bool) {
+        let settings = self.stream_settings.get(&stream).unwrap_or(&self.settings);
+        let Some(active) = self.streams.get_mut(&stream) else {
+            return;
+        };
+        if active.reported_enabled != Some(enabled) {
+            if let Some(logger) = &self.logger {
+                let message = serde_json::json!({
+                    "event": "rtx_hdr_conversion",
+                    "stream": stream,
+                    "enabled": enabled,
+                    "width": frame.width,
+                    "height": frame.height,
+                    "peak_nits": settings.peak_luminance,
+                    "source": "srgb",
+                    "output": "bt2020_pq",
+                })
+                .to_string();
+                let _ = logger.emit(amaterasu_module_sdk::LogLevel::Info, "rtx-hdr", &message);
+            }
+            active.reported_enabled = Some(enabled);
+        }
+    }
+
+    /// The selected device's UUID, which names the CUDA context frames live in.
+    fn device_uuid(&mut self) -> Result<[u8; 16], Status> {
+        if let Some(uuid) = self.device_uuid {
+            return Ok(uuid);
+        }
+        let uuid = resource::device_uuid(&self.settings, self.logger.as_ref())?;
+        self.device_uuid = Some(uuid);
+        Ok(uuid)
     }
 }
 impl Drop for Processor {
@@ -697,96 +814,71 @@ impl GpuFrameProcessor for Processor {
         Ok(())
     }
     fn process(&mut self, stream: u64, input: GpuFrame<'_>) -> Result<GpuOutputFrame, Status> {
+        let enabled = self.prepare(stream, input.frame())?;
+        let active = self.streams.get_mut(&stream).expect("stream was prepared");
+        let output = active.process(&input, self.logger.as_ref())?;
+        self.report_conversion(stream, input.frame(), enabled);
+        Ok(output)
+    }
+    fn output_offers(&mut self, stream: u64) -> Result<(u64, Vec<CaptureResourceOffer>), Status> {
         if self.retired.contains(&stream) {
             return Err(MEDIA_CLOSED);
         }
-        let frame = input.frame();
-        if !supported_input(frame) {
-            if let Some(logger) = &self.logger {
-                let message = serde_json::json!({
-                    "event": "rtx_hdr_input_rejected",
-                    "stream": stream,
-                    "width": frame.width,
-                    "height": frame.height,
-                    "color": frame.color,
-                    "fourcc": frame.fourcc,
-                    "planes": frame.plane_count,
-                    "pitch": frame.planes[0].pitch,
-                    "offset": frame.planes[0].offset,
-                })
-                .to_string();
-                let _ = logger.emit(amaterasu_module_sdk::LogLevel::Error, "rtx-hdr", &message);
-            }
-            return Err(MEDIA_UNSUPPORTED);
+        if !self.stream_settings.contains_key(&stream) && !self.streams.contains_key(&stream) {
+            return Err(STATUS_INVALID_ARGUMENT);
         }
-        if !self.streams.contains_key(&stream) {
-            if self.streams.len() >= self.settings.max_streams || self.retired.len() >= 1024 {
-                return Err(MEDIA_BUSY);
-            }
-            self.streams.insert(
-                stream,
-                Stream::open(
-                    self.stream_settings.get(&stream).unwrap_or(&self.settings),
-                    frame.width,
-                    frame.height,
-                    self.logger.as_ref(),
-                )?,
-            );
+        let uuid = self.device_uuid()?;
+        let offers = self
+            .resource_outputs
+            .entry(stream)
+            .or_insert_with(|| resource::ResourceOutput::new(uuid));
+        Ok((offers.generation(), vec![offers.offer()]))
+    }
+    fn select_output(&mut self, stream: u64, generation: u64, offer: u64) -> Result<(), Status> {
+        if self.retired.contains(&stream) {
+            return Err(MEDIA_CLOSED);
         }
-        if !self.stream_settings.contains_key(&stream) {
-            self.set_demand(
-                stream,
-                self.settings.enabled
-                    && (self.settings.foreground_only || self.settings.fullscreen_only),
-            );
-        }
-        let settings = self.stream_settings.get(&stream).unwrap_or(&self.settings);
-        let enabled = settings.enabled
-            && if !settings.foreground_only && !settings.fullscreen_only {
-                true
-            } else {
-                self.policy.as_ref().is_some_and(|policy| {
-                    policy.lock().ok().is_some_and(|policy| {
-                        policy.enabled(
-                            self.targets.get(&stream).and_then(Option::as_ref),
-                            settings.foreground_only,
-                            settings.fullscreen_only,
-                            std::time::Instant::now(),
-                        )
-                    })
-                })
-            };
-        let active = self.streams.get_mut(&stream).expect("stream was opened");
-        if active.enabled != enabled {
-            active.configure(settings, enabled, self.logger.as_ref())?;
-            active.enabled = enabled;
-        }
-        let output = active.process(&input, self.logger.as_ref())?;
-        if active.reported_enabled != Some(enabled) {
-            if let Some(logger) = &self.logger {
-                let message = serde_json::json!({
-                    "event": "rtx_hdr_conversion",
-                    "stream": stream,
-                    "enabled": enabled,
-                    "width": frame.width,
-                    "height": frame.height,
-                    "peak_nits": settings.peak_luminance,
-                    "source": "srgb",
-                    "output": "bt2020_pq",
-                })
-                .to_string();
-                let _ = logger.emit(amaterasu_module_sdk::LogLevel::Info, "rtx-hdr", &message);
-            }
-            active.reported_enabled = Some(enabled);
-        }
+        self.resource_outputs
+            .get_mut(&stream)
+            .ok_or(MEDIA_UNSUPPORTED)?
+            .select(generation, offer)
+    }
+    fn process_to_resource(
+        &mut self,
+        stream: u64,
+        input: GpuFrame<'_>,
+    ) -> Result<ResourceOutputFrame, Status> {
+        let handoff = self
+            .resource_outputs
+            .get(&stream)
+            .and_then(resource::ResourceOutput::selection)
+            .ok_or(MEDIA_UNSUPPORTED)?;
+        let device_uuid = self.device_uuid()?;
+        let enabled = self.prepare(stream, input.frame())?;
+        let output_buffers = self
+            .stream_settings
+            .get(&stream)
+            .unwrap_or(&self.settings)
+            .output_buffers;
+        let active = self.streams.get_mut(&stream).expect("stream was prepared");
+        let output = active.process_resource(
+            &input,
+            handoff,
+            output_buffers,
+            device_uuid,
+            self.logger.as_ref(),
+        )?;
+        self.report_conversion(stream, input.frame(), enabled);
         Ok(output)
     }
     fn cancel(&mut self, stream: u64) {
         self.set_demand(stream, false);
         self.stream_settings.remove(&stream);
         self.targets.remove(&stream);
+        self.resource_outputs.remove(&stream);
         if let Some(mut active) = self.streams.remove(&stream) {
             active.cached = None;
+            active.cached_resource = None;
             active.retire_inputs();
             active.assert_retired();
         }
@@ -795,8 +887,10 @@ impl GpuFrameProcessor for Processor {
         }
     }
     fn shutdown(&mut self) {
+        self.resource_outputs.clear();
         for stream in self.streams.values_mut() {
             stream.cached = None;
+            stream.cached_resource = None;
             stream.retire_inputs();
             stream.assert_retired();
         }
@@ -831,5 +925,6 @@ fn supported_input(frame: &DmaBufFrame) -> bool {
         && frame.planes[0].pitch <= i32::MAX as u32
 }
 
+mod resource;
 #[cfg(test)]
 mod tests;

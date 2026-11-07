@@ -156,7 +156,7 @@ void Session::convert() {
     cuda_check(api->map(2, resources, stream), "map effect textures");
     try {
         timing.model_queued(*api, stream, true);
-        copy_array(*api, stream, mapped_array(*api, input_resource), input, true);
+        copy_input();
         vfx_check(api->run_effect(effect, 1), "run TrueHDR");
         copy_array(*api, stream, mapped_array(*api, output_resource), output, false);
         timing.model_queued(*api, stream, false);
@@ -168,6 +168,11 @@ void Session::convert() {
     cuda_check(api->unmap(2, resources, stream), "unmap effect textures");
 }
 
+// The input texture must be mapped on this session's stream.
+void Session::copy_input() {
+    copy_array(*api, stream, mapped_array(*api, input_resource), input, true);
+}
+
 void Session::close() {
     if (context && surface.context != EGL_NO_CONTEXT) {
         try {
@@ -175,6 +180,8 @@ void Session::close() {
             if (stream)
                 cuda_check(api->synchronize_stream(stream), "retire effect stream");
             timing.close(*api);
+            if (kernels)
+                api->unload_module(kernels);
             if (input_resource)
                 cuda_check(api->unregister_image(input_resource), "retire effect input");
             if (output_resource)
