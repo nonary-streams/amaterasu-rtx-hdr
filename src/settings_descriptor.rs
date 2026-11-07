@@ -158,6 +158,7 @@ pub fn descriptor() -> ExtensionDescriptor {
     ExtensionDescriptor {
         provider: PROVIDER.into(),
         display_name: Some("RTX HDR".into()),
+        default_expanded: true,
         revision: 3,
         options,
         actions: vec![],
@@ -221,6 +222,9 @@ mod tests {
     #[test]
     fn descriptor_defaults_and_scoped_ranges_validate() {
         let descriptor = descriptor();
+        assert!(descriptor.default_expanded);
+        let metadata = installation_metadata();
+        assert_eq!(metadata["descriptor"]["default_expanded"], true);
         amaterasu_module_sdk::extension_api::validate_descriptor(&descriptor).unwrap();
         let enable = descriptor
             .options

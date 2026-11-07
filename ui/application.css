@@ -1,0 +1,22 @@
+.rtx-hdr-settings { display: grid; gap: 12px; min-width: 0; }
+.rtx-hdr-help { color: var(--fg); font-size: 14px; max-width: 72ch; }
+.rtx-hdr-timing { color: var(--secondary); font-size: 12px; max-width: 80ch; }
+.rtx-hdr-groups { display: grid; gap: 24px; margin-top: 12px; }
+.rtx-hdr-group { min-width: 0; }
+.rtx-hdr-group h3 { margin: 0 0 10px; font-size: 13px; font-weight: 600; color: var(--secondary); }
+.rtx-hdr-rows { overflow: hidden; border: 1px solid var(--line); border-radius: 10px; }
+.rtx-hdr-setting { padding: 16px; background: var(--bg); }
+.rtx-hdr-setting + .rtx-hdr-setting { border-top: 1px solid var(--line); }
+.rtx-hdr-setting > .plugin-control { width: 100%; margin: 0; min-width: 0; }
+.rtx-hdr-setting .field-label { font-size: 14px; font-weight: 500; }
+.rtx-hdr-setting .plugin-slider-inputs { width: 100%; max-width: none; }
+.rtx-hdr-setting .plugin-slider-inputs input[type="number"] { width: 5.5rem; min-width: 0; padding: 8px; }
+.rtx-hdr-advanced > summary { padding: 12px 0; color: var(--secondary); font-size: 13px; font-weight: 600; cursor: pointer; }
+.rtx-hdr-advanced[open] > summary { margin-bottom: 4px; }
+.rtx-hdr-advanced > summary:focus-visible { outline-offset: 2px; }
+.rtx-hdr-footer { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; margin-top: 8px; padding-top: 16px; border-top: 1px solid var(--line); }
+.rtx-hdr-footer .plugin-control { width: auto; margin: 0; }
+.rtx-hdr-status { color: var(--secondary); font-size: 12px; overflow-wrap: anywhere; }
+@media (max-width: 640px) {
+  .rtx-hdr-setting { padding: 14px; }
+}

@@ -1,5 +1,6 @@
 {
   "placements": ["application"],
   "settings_provider": "amaterasu.rtx-hdr",
+  "default_expanded": true,
   "methods": []
 }

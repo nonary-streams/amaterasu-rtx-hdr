@@ -5,6 +5,7 @@
       "amaterasu.stream/join"
     ],
     "display_name": "RTX HDR",
+    "default_expanded": true,
     "options": [
       {
         "allowed_scopes": [
