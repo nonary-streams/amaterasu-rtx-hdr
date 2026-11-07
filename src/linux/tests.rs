@@ -1241,6 +1241,9 @@ fn nvidia_reports_gpu_stage_timing_without_waiting() {
         .unwrap_or(288);
     let stream = Stream::open(&config, width, height, None).unwrap();
     let session = stream.slots[0].session.clone();
+    eprintln!("RTX HDR context priority: {:#x}", unsafe {
+        am_rtx_context_priority(session.0.as_ptr())
+    });
     let source = Source::new(session.clone());
     let mut processor = Processor::new(config);
     processor.streams.insert(77, stream);
