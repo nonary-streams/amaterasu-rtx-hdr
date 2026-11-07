@@ -274,7 +274,45 @@ fn sdk_toggle_preserves_scope_metadata_and_atomic_rejection() {
 unsafe extern "C" fn input_retain(_: *mut c_void) -> Status {
     STATUS_OK
 }
-unsafe extern "C" fn input_release(_: *mut c_void, _: i32) {}
+unsafe extern "C" fn input_release(_: *mut c_void, fence: i32) {
+    if fence >= 0 {
+        // SAFETY: the lease ABI transfers ownership of a nonnegative fence.
+        unsafe { libc::close(fence) };
+    }
+}
+
+/// An input provider that counts the processor's independent references and
+/// waits on each completion fence, as the capture provider does before reuse.
+struct CountingInput {
+    source: Source,
+    references: Cell<i32>,
+    fenced_releases: Cell<u32>,
+}
+impl CountingInput {
+    fn lease(&self) -> DmaBufFrameLease {
+        DmaBufFrameLease {
+            context: std::ptr::from_ref(self).cast_mut().cast(),
+            retain: Some(counting_retain),
+            release: Some(counting_release),
+            ..self.source.lease()
+        }
+    }
+}
+unsafe extern "C" fn counting_retain(context: *mut c_void) -> Status {
+    let input = unsafe { &*context.cast::<CountingInput>() };
+    input.references.set(input.references.get() + 1);
+    STATUS_OK
+}
+unsafe extern "C" fn counting_release(context: *mut c_void, fence: i32) {
+    let input = unsafe { &*context.cast::<CountingInput>() };
+    if fence >= 0 {
+        assert_eq!(unsafe { am_rtx_wait_fence(fence) }, 0, "completion fence");
+        unsafe { libc::close(fence) };
+        input.fenced_releases.set(input.fenced_releases.get() + 1);
+    }
+    input.references.set(input.references.get() - 1);
+    assert!(input.references.get() >= 0, "release without retain");
+}
 
 unsafe extern "C" {
     fn am_rtx_test_source(context: *mut c_void, frame: *mut DmaBufFrame) -> *mut c_void;
@@ -1084,6 +1122,104 @@ fn nvidia_gpu_processes_real_pixels_and_preserves_bounded_ownership() {
     );
     unsafe {
         (api.cancel_dmabuf_leases)(api.base.context, 88);
+        api.base.release.unwrap()(api.base.context);
+    }
+}
+
+#[test]
+#[ignore = "requires an NVIDIA RTX GPU and AMATERASU_TRUEHDR_RUNTIME"]
+fn nvidia_conversion_stays_queued_with_fenced_output_and_retained_input() {
+    let mut config = settings();
+    config.runtime_directory = std::env::var_os("AMATERASU_TRUEHDR_RUNTIME")
+        .expect("runtime path")
+        .into();
+    let stream = Stream::open(&config, 512, 288, None).unwrap();
+    let session = stream.slots[0].session.clone();
+    assert_eq!(
+        unsafe { am_rtx_test_native_fence_available(session.0.as_ptr()) },
+        1,
+        "the asynchronous handoff requires native fences"
+    );
+    let input = CountingInput {
+        source: Source::new(session.clone()),
+        references: Cell::new(0),
+        fenced_releases: Cell::new(0),
+    };
+    let mut processor = Processor::new(config);
+    processor.streams.insert(77, stream);
+    let raw = into_gpu_binding(processor);
+    let api = unsafe { &*raw };
+    let mut baseline = None;
+    for sequence in 1..=6 {
+        let mut lease = input.lease();
+        lease.frame.sequence = sequence;
+        let result = unsafe {
+            process_gpu(api, 77, &lease, CAPTURE_FRAME_FRESH, |output| {
+                // The output is lent before the GPU finishes; its acquire
+                // fence, not a CPU barrier, orders the consumer's reads.
+                let fence = output.frame.planes[0].acquire_fence_fd;
+                assert!(fence >= 0, "output must carry an acquire fence");
+                assert_eq!(am_rtx_wait_fence(fence), 0);
+                let pixels = read(output);
+                match &baseline {
+                    Some(previous) => assert_eq!(&pixels, previous),
+                    None => baseline = Some(pixels),
+                }
+                STATUS_OK
+            })
+        };
+        assert_eq!(result, ProcessingOutcome::Accepted);
+        // The conversion may still read the input, so the processor keeps an
+        // independent reference within its bounded retirement queue.
+        let held = input.references.get();
+        assert!(
+            (1..=MAX_PENDING_INPUTS as i32).contains(&held),
+            "input references after frame {sequence}: {held}"
+        );
+    }
+    unsafe { (api.cancel_dmabuf_leases)(api.base.context, 77) };
+    assert_eq!(input.references.get(), 0, "cancel retires every input");
+    assert!(
+        input.fenced_releases.get() >= 1,
+        "inputs released with fences"
+    );
+    unsafe { api.base.release.unwrap()(api.base.context) };
+}
+
+#[test]
+#[ignore = "requires an NVIDIA RTX GPU and AMATERASU_TRUEHDR_RUNTIME"]
+fn nvidia_without_native_fences_completes_before_returning() {
+    let mut config = settings();
+    config.runtime_directory = std::env::var_os("AMATERASU_TRUEHDR_RUNTIME")
+        .expect("runtime path")
+        .into();
+    let stream = Stream::open(&config, 512, 288, None).unwrap();
+    let session = stream.slots[0].session.clone();
+    let input = CountingInput {
+        source: Source::new(session.clone()),
+        references: Cell::new(0),
+        fenced_releases: Cell::new(0),
+    };
+    unsafe { am_rtx_test_disable_native_fence(session.0.as_ptr()) };
+    let mut processor = Processor::new(config);
+    processor.streams.insert(77, stream);
+    let raw = into_gpu_binding(processor);
+    let api = unsafe { &*raw };
+    let result = unsafe {
+        process_gpu(api, 77, &input.lease(), CAPTURE_FRAME_FRESH, |output| {
+            assert_eq!(output.frame.planes[0].acquire_fence_fd, -1);
+            STATUS_OK
+        })
+    };
+    assert_eq!(result, ProcessingOutcome::Accepted);
+    assert_eq!(
+        input.references.get(),
+        0,
+        "synchronous completion releases input"
+    );
+    assert_eq!(input.fenced_releases.get(), 0);
+    unsafe {
+        (api.cancel_dmabuf_leases)(api.base.context, 77);
         api.base.release.unwrap()(api.base.context);
     }
 }

@@ -78,13 +78,16 @@ struct Surface {
     PFNEGLCREATESYNCKHRPROC create_sync = nullptr;
     PFNEGLDESTROYSYNCKHRPROC destroy_sync = nullptr;
     PFNEGLDUPNATIVEFENCEFDANDROIDPROC duplicate_fence = nullptr;
+    PFNEGLWAITSYNCKHRPROC wait_sync = nullptr;
+    bool priority_query = false;
     GLuint input = 0, output = 0, input_fbo = 0, output_fbo = 0;
     GLuint source = 0, program = 0, output_program = 0, fallback_program = 0, vao = 0;
     void open(CUdevice device);
     void prepare(uint32_t width, uint32_t height);
     EGLImageKHR import(const AmaterasuDmaBufFrame &frame);
     void capture(const AmaterasuDmaBufFrame &frame);
-    void finish();
+    void wait_acquire(int fence_fd);
+    int complete();
     void close();
 };
 
@@ -125,7 +128,8 @@ struct Session {
     Session(const std::string &root, int ordinal, uint32_t width, uint32_t height,
             const uint32_t *parameters);
     ~Session();
-    void run(const AmaterasuDmaBufFrame &frame, Output &destination);
+    int run(const AmaterasuDmaBufFrame &frame, Output &destination);
+    void convert();
     void configure(const uint32_t *values, bool active, uint32_t brightness);
     void *create_configured_effect(const uint32_t *values);
     void close();
@@ -137,7 +141,8 @@ void *am_rtx_open(const char *, int, uint32_t, uint32_t, const uint32_t *, char 
 void am_rtx_close(void *);
 void *am_rtx_output_open(void *, AmaterasuDmaBufFrame *, char *, size_t);
 void am_rtx_output_close(void *, void *);
-int am_rtx_process(void *, const AmaterasuDmaBufFrame *, void *, char *, size_t);
+int am_rtx_process(void *, const AmaterasuDmaBufFrame *, void *, int *, char *, size_t);
 int am_rtx_configure(void *, const uint32_t *, bool, uint32_t, char *, size_t);
 int am_rtx_wait_fence(int);
+int am_rtx_context_priority(void *);
 }

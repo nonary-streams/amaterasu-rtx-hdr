@@ -210,12 +210,13 @@ extern "C" void am_rtx_output_close(void *context, void *raw) {
     }
 }
 extern "C" int am_rtx_process(void *context, const AmaterasuDmaBufFrame *frame, void *output,
-                              char *error, size_t capacity) {
+                              int *completion_fence, char *error, size_t capacity) {
     auto &session = *static_cast<rtx::Session *>(context);
+    *completion_fence = -1;
     try {
         rtx::Current current(*session.api, session.surface, session.context);
         try {
-            session.run(*frame, *static_cast<rtx::Output *>(output));
+            *completion_fence = session.run(*frame, *static_cast<rtx::Output *>(output));
         } catch (...) {
             // No input borrow may escape on failure. Returning after an unknown
             // GPU completion would violate the provider's ownership contract.
@@ -241,6 +242,15 @@ extern "C" int am_rtx_configure(void *context, const uint32_t *parameters, bool 
         report(error, capacity, failure);
         return -1;
     }
+}
+extern "C" int am_rtx_context_priority(void *context) {
+    auto &surface = static_cast<rtx::Session *>(context)->surface;
+    EGLint priority = EGL_CONTEXT_PRIORITY_MEDIUM_IMG;
+    if (!surface.priority_query ||
+        !eglQueryContext(surface.display, surface.context, EGL_CONTEXT_PRIORITY_LEVEL_IMG,
+                         &priority))
+        return 0;
+    return priority;
 }
 extern "C" int am_rtx_wait_fence(int fd) {
     try {

@@ -63,6 +63,7 @@ extern "C" void am_rtx_test_disable_native_fence(void *raw) {
     surface.create_sync = nullptr;
     surface.destroy_sync = nullptr;
     surface.duplicate_fence = nullptr;
+    surface.wait_sync = nullptr;
 }
 extern "C" int am_rtx_test_read(void *raw, void *surface, uint32_t *pixels, size_t length) {
     auto &session = *static_cast<rtx::Session *>(raw);

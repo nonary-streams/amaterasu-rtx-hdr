@@ -106,6 +106,11 @@ void Surface::open(CUdevice cuda_device) {
         destroy_sync = reinterpret_cast<PFNEGLDESTROYSYNCKHRPROC>(eglGetProcAddress("eglDestroySyncKHR"));
         duplicate_fence = reinterpret_cast<PFNEGLDUPNATIVEFENCEFDANDROIDPROC>(
             eglGetProcAddress("eglDupNativeFenceFDANDROID"));
+        // Lets this context wait for a producer's sync_file on the GPU
+        // rather than blocking the processing thread until it signals.
+        if (extension(extensions, "EGL_KHR_wait_sync"))
+            wait_sync =
+                reinterpret_cast<PFNEGLWAITSYNCKHRPROC>(eglGetProcAddress("eglWaitSyncKHR"));
     }
     const EGLenum previous_api = eglQueryAPI();
     if (!eglBindAPI(EGL_OPENGL_API))
@@ -114,10 +119,26 @@ void Surface::open(CUdevice cuda_device) {
                                         EGL_PBUFFER_BIT, EGL_NONE};
     EGLConfig config = nullptr;
     EGLint configs = 0;
+    // A game saturating the GPU otherwise delays every queued conversion by
+    // its scheduling timeslice. Request a high-priority context; drivers may
+    // grant less (NVIDIA requires CAP_SYS_NICE), so the granted level is
+    // queried and reported rather than assumed.
+    priority_query = extension(extensions, "EGL_IMG_context_priority");
+    const EGLint prioritized_attributes[] = {EGL_CONTEXT_MAJOR_VERSION,
+                                             3,
+                                             EGL_CONTEXT_MINOR_VERSION,
+                                             3,
+                                             EGL_CONTEXT_PRIORITY_LEVEL_IMG,
+                                             EGL_CONTEXT_PRIORITY_HIGH_IMG,
+                                             EGL_NONE};
     const EGLint context_attributes[] = {EGL_CONTEXT_MAJOR_VERSION, 3, EGL_CONTEXT_MINOR_VERSION, 3,
                                          EGL_NONE};
-    if (eglChooseConfig(display, config_attributes, &config, 1, &configs) && configs > 0)
-        context = eglCreateContext(display, config, EGL_NO_CONTEXT, context_attributes);
+    if (eglChooseConfig(display, config_attributes, &config, 1, &configs) && configs > 0) {
+        if (priority_query)
+            context = eglCreateContext(display, config, EGL_NO_CONTEXT, prioritized_attributes);
+        if (context == EGL_NO_CONTEXT)
+            context = eglCreateContext(display, config, EGL_NO_CONTEXT, context_attributes);
+    }
     eglBindAPI(previous_api);
     if (context == EGL_NO_CONTEXT)
         throw std::runtime_error("cannot create effect OpenGL context");
@@ -284,8 +305,34 @@ EGLImageKHR Surface::import(const AmaterasuDmaBufFrame &frame) {
     return image;
 }
 
+void Surface::wait_acquire(int fence_fd) {
+    if (fence_fd < 0)
+        return;
+    if (create_sync && destroy_sync && wait_sync) {
+        // The producer keeps its fence until release; EGL consumes a duplicate.
+        const int duplicate = ::fcntl(fence_fd, F_DUPFD_CLOEXEC, 0);
+        if (duplicate >= 0) {
+            const EGLint attributes[] = {EGL_SYNC_NATIVE_FENCE_FD_ANDROID, duplicate, EGL_NONE};
+            EGLSyncKHR sync = create_sync(display, EGL_SYNC_NATIVE_FENCE_ANDROID, attributes);
+            if (sync != EGL_NO_SYNC_KHR) {
+                // A queued server wait orders every later command in this
+                // context after the producer's writes without a CPU stall.
+                const EGLBoolean queued = wait_sync(display, sync, 0);
+                destroy_sync(display, sync);
+                if (queued == EGL_TRUE)
+                    return;
+                // EGL owns the duplicate once the sync exists. Without a
+                // queued wait, fall back to the producer's fence below.
+            } else {
+                ::close(duplicate);
+            }
+        }
+    }
+    wait_fence(fence_fd);
+}
+
 void Surface::capture(const AmaterasuDmaBufFrame &frame) {
-    wait_fence(frame.planes[0].acquire_fence_fd);
+    wait_acquire(frame.planes[0].acquire_fence_fd);
     auto image = import(frame);
     try {
         glActiveTexture(GL_TEXTURE0);
@@ -302,7 +349,7 @@ void Surface::capture(const AmaterasuDmaBufFrame &frame) {
         glDrawArrays(GL_TRIANGLES, 0, 3);
         // The input texture is consumed either by CUDA graphics-map or by the
         // fallback GL draw in this same context. Both preserve this dependency.
-        // The final output completion wait still completes every borrowed input read.
+        // The completion fence created after the output draw covers this read.
         gl_check("effect source sampling failed");
     } catch (...) {
         glFinish();
@@ -312,37 +359,30 @@ void Surface::capture(const AmaterasuDmaBufFrame &frame) {
     destroy_image(display, image);
 }
 
-void Surface::finish() {
-    // A native sync_file lets the calling thread sleep while the GPU finishes.
-    // This fence is inserted after the input read and output draw, and the CUDA
-    // unmap orders the model's writes before that draw. If native fences are
-    // unavailable, preserve the existing synchronous GL completion barrier.
+int Surface::complete() {
+    // The fence follows the input read and output draw in this context, and
+    // the CUDA unmap orders the model's writes before that draw. Its owner
+    // hands it downstream as the output's acquire fence and waits on it before
+    // releasing the borrowed input, so no thread blocks here on GPU progress.
+    // Without native fences, complete synchronously and return no fence.
     if (!create_sync || !destroy_sync || !duplicate_fence) {
         glFinish();
-        return;
+        return -1;
     }
     EGLSyncKHR sync = create_sync(display, EGL_SYNC_NATIVE_FENCE_ANDROID, nullptr);
     if (sync == EGL_NO_SYNC_KHR) {
         glFinish();
-        return;
+        return -1;
     }
+    // The native fence exists only once its command reaches the GPU queue.
     glFlush();
-    int fd = duplicate_fence(display, sync);
+    const int fd = duplicate_fence(display, sync);
     destroy_sync(display, sync);
     if (fd < 0) {
         glFinish();
-        return;
+        return -1;
     }
-    try {
-        wait_fence(fd);
-    } catch (...) {
-        ::close(fd);
-        // The fence is only an optimization. If it cannot prove completion,
-        // retain the original GL barrier before lending or reusing pixels.
-        glFinish();
-        return;
-    }
-    ::close(fd);
+    return fd;
 }
 
 void Surface::close() {
@@ -382,6 +422,9 @@ void Output::open(Surface &surface, uint32_t width, uint32_t height, uint32_t fo
     gl_check("HDR output import failed");
 }
 void Output::close(Surface &surface) {
+    // A rejected delivery can release the last reference before anyone waited
+    // on the output fence. Retire this context's queued writes before freeing.
+    glFinish();
     glDeleteFramebuffers(1, &fbo);
     glDeleteTextures(1, &texture);
     if (image != EGL_NO_IMAGE_KHR)
