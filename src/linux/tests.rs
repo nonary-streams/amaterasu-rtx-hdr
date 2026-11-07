@@ -179,6 +179,19 @@ fn unsupported_input_is_rejected_before_loading_vendor_code() {
         api.base.release.unwrap()(api.base.context);
     }
 }
+
+#[test]
+fn packed_rgb_sdr_accepts_both_scanout_depths_without_accepting_hdr() {
+    for format in [
+        *b"XR24", *b"AR24", *b"XB24", *b"AB24", *b"XR30", *b"AR30", *b"XB30", *b"AB30",
+    ] {
+        let mut input = frame();
+        input.fourcc = u32::from_le_bytes(format);
+        assert!(supported_input(&input));
+        input.color = DMABUF_COLOR_BT2020_PQ;
+        assert!(!supported_input(&input));
+    }
+}
 #[test]
 fn stream_controls_update_atomically_and_retire_with_stream() {
     let mut processor = Processor::new(settings());
@@ -265,6 +278,20 @@ unsafe extern "C" fn input_release(_: *mut c_void, _: i32) {}
 
 unsafe extern "C" {
     fn am_rtx_test_source(context: *mut c_void, frame: *mut DmaBufFrame) -> *mut c_void;
+    fn am_rtx_test_source_format(
+        context: *mut c_void,
+        frame: *mut DmaBufFrame,
+        format: u32,
+    ) -> *mut c_void;
+    fn am_rtx_test_fill_source(
+        context: *mut c_void,
+        source: *mut c_void,
+        red: f32,
+        green: f32,
+        blue: f32,
+    ) -> i32;
+    fn am_rtx_test_native_fence_available(context: *mut c_void) -> i32;
+    fn am_rtx_test_disable_native_fence(context: *mut c_void);
     fn am_rtx_test_read(
         context: *mut c_void,
         output: *mut c_void,
@@ -281,8 +308,16 @@ struct Source {
 }
 impl Source {
     fn new(session: Rc<NativeSession>) -> Self {
+        Self::new_format(session, None)
+    }
+    fn new_format(session: Rc<NativeSession>, format: Option<u32>) -> Self {
         let mut frame = frame();
-        let raw = unsafe { am_rtx_test_source(session.0.as_ptr(), &mut frame) };
+        let raw = unsafe {
+            match format {
+                Some(format) => am_rtx_test_source_format(session.0.as_ptr(), &mut frame, format),
+                None => am_rtx_test_source(session.0.as_ptr(), &mut frame),
+            }
+        };
         assert!(!raw.is_null(), "GPU test source allocation failed");
         frame.timestamp_us = 66;
         frame.sequence = 1;
@@ -337,18 +372,335 @@ fn nits(code: u32) -> f64 {
 }
 
 #[test]
-#[ignore = "requires an NVIDIA RTX GPU and AMATERASU_TRUEHDR_RUNTIME pointing to the licensed VFX runtime"]
-fn nvidia_sdk_toggle_from_disabled_preserves_frames_and_hdr_output() {
+#[ignore = "opt-in GPU timing fixture; requires NVIDIA RTX and AMATERASU_TRUEHDR_RUNTIME"]
+fn nvidia_benchmark_frame_processing() {
+    let mut config = settings();
+    config.runtime_directory = std::env::var_os("AMATERASU_TRUEHDR_RUNTIME")
+        .expect("runtime path")
+        .into();
+    let width = std::env::var("AMATERASU_RTX_BENCH_WIDTH")
+        .unwrap_or_else(|_| "512".into())
+        .parse::<u32>()
+        .unwrap();
+    let height = std::env::var("AMATERASU_RTX_BENCH_HEIGHT")
+        .unwrap_or_else(|_| "288".into())
+        .parse::<u32>()
+        .unwrap();
+    assert!((16..=8192).contains(&width) && (16..=8192).contains(&height));
+    let stream = Stream::open(&config, width, height, None).unwrap();
+    let source = Source::new(stream.slots[0].session.clone());
+    let mut processor = Processor::new(config);
+    processor.streams.insert(77, stream);
+    let raw = into_gpu_binding(processor);
+    let api = unsafe { &*raw };
+    let input = source.lease();
+    let process = || unsafe { process_gpu(api, 77, &input, CAPTURE_FRAME_FRESH, |_| STATUS_OK) };
+    for _ in 0..10 {
+        assert_eq!(process(), ProcessingOutcome::Accepted);
+    }
+    let mut before = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    let mut after = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    assert_eq!(
+        unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut before) },
+        0
+    );
+    let started = std::time::Instant::now();
+    for _ in 0..100 {
+        assert_eq!(process(), ProcessingOutcome::Accepted);
+    }
+    let elapsed = started.elapsed();
+    assert_eq!(
+        unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut after) },
+        0
+    );
+    let cpu_ns = (after.tv_sec - before.tv_sec) as i128 * 1_000_000_000
+        + (after.tv_nsec - before.tv_nsec) as i128;
+    eprintln!(
+        "RTX HDR benchmark {width}x{height}: 100 frames, wall_us={}, thread_cpu_us={}",
+        elapsed.as_micros(),
+        cpu_ns / 1000
+    );
+    unsafe {
+        (api.cancel_dmabuf_leases)(api.base.context, 77);
+        api.base.release.unwrap()(api.base.context);
+    }
+}
+
+#[test]
+#[ignore = "requires an NVIDIA RTX GPU and AMATERASU_TRUEHDR_RUNTIME"]
+fn nvidia_repeated_unchanged_frame_has_identical_output() {
+    let mut config = settings();
+    config.runtime_directory = std::env::var_os("AMATERASU_TRUEHDR_RUNTIME")
+        .expect("runtime path")
+        .into();
+    let stream = Stream::open(&config, 512, 288, None).unwrap();
+    let source = Source::new(stream.slots[0].session.clone());
+    let mut processor = Processor::new(config);
+    processor.streams.insert(77, stream);
+    let raw = into_gpu_binding(processor);
+    let api = unsafe { &*raw };
+    let mut baseline = None;
+    for _ in 0..8 {
+        let result = unsafe {
+            process_gpu(api, 77, &source.lease(), CAPTURE_FRAME_FRESH, |output| {
+                let pixels = read(output);
+                if let Some(previous) = &baseline {
+                    assert_eq!(&pixels, previous);
+                } else {
+                    baseline = Some(pixels);
+                }
+                STATUS_OK
+            })
+        };
+        assert_eq!(result, ProcessingOutcome::Accepted);
+    }
+    unsafe {
+        (api.cancel_dmabuf_leases)(api.base.context, 77);
+        api.base.release.unwrap()(api.base.context);
+    }
+}
+
+#[test]
+#[ignore = "requires an NVIDIA RTX GPU and AMATERASU_TRUEHDR_RUNTIME"]
+fn nvidia_cached_frame_survives_rejection_and_invalidates_on_change() {
     let mut config = settings();
     config.runtime_directory = std::env::var_os("AMATERASU_TRUEHDR_RUNTIME")
         .expect("runtime path")
         .into();
     config.output_buffers = 2;
     let stream = Stream::open(&config, 512, 288, None).unwrap();
+    let session = stream.slots[0].session.clone();
+    let source = Source::new(session.clone());
+    let mut processor = Processor::new(config);
+    let (mut controls, _) = intent_settings();
+    processor
+        .configure_stream(77, &serde_json::to_vec(&controls).unwrap())
+        .unwrap();
+    processor.streams.insert(77, stream);
+    let raw = into_gpu_binding(processor);
+    let api = unsafe { &*raw };
+    let mut rejected_context = std::ptr::null_mut();
+    let initial = source.lease();
+    assert_eq!(
+        unsafe {
+            process_gpu(api, 77, &initial, CAPTURE_FRAME_FRESH, |output| {
+                rejected_context = output.context;
+                MEDIA_BUSY
+            })
+        },
+        ProcessingOutcome::Busy
+    );
+
+    let mut repeated = initial;
+    repeated.frame.timestamp_us += 100;
+    let mut held = None;
+    assert_eq!(
+        unsafe {
+            process_gpu(api, 77, &repeated, CAPTURE_FRAME_CACHED_REUSE, |output| {
+                assert_eq!(output.context, rejected_context);
+                assert_eq!(output.frame.timestamp_us, repeated.frame.timestamp_us);
+                assert_eq!(output.retain.unwrap()(output.context), STATUS_OK);
+                held = Some(*output);
+                STATUS_OK
+            })
+        },
+        ProcessingOutcome::Accepted
+    );
+    let held = held.unwrap();
+    let original = read(&held);
+    assert_eq!(
+        unsafe { am_rtx_test_fill_source(session.0.as_ptr(), source.raw, 1.0, 1.0, 1.0) },
+        0
+    );
+    let mut changed = source.lease();
+    changed.frame.sequence += 1;
+    let mut changed_pixels = None;
+    assert_eq!(
+        unsafe {
+            process_gpu(api, 77, &changed, CAPTURE_FRAME_FRESH, |output| {
+                assert_ne!(output.context, held.context);
+                changed_pixels = Some(read(output));
+                STATUS_OK
+            })
+        },
+        ProcessingOutcome::Accepted
+    );
+    let changed_pixels = changed_pixels.unwrap();
+    assert_ne!(changed_pixels, original);
+    assert_eq!(read(&held), original);
+
+    controls["rtx_hdr_enable"] = false.into();
+    assert_eq!(
+        unsafe { update_gpu_stream(api, 77, &serde_json::to_vec(&controls).unwrap()) },
+        Ok(())
+    );
+    let mut fallback = None;
+    assert_eq!(
+        unsafe {
+            process_gpu(api, 77, &changed, CAPTURE_FRAME_CACHED_REUSE, |output| {
+                fallback = Some(read(output));
+                STATUS_OK
+            })
+        },
+        ProcessingOutcome::Accepted
+    );
+    assert_ne!(fallback.unwrap(), changed_pixels);
+    unsafe {
+        held.release.unwrap()(held.context, -1);
+        (api.cancel_dmabuf_leases)(api.base.context, 77);
+        api.base.release.unwrap()(api.base.context);
+    }
+}
+
+#[test]
+#[ignore = "requires an NVIDIA RTX GPU and AMATERASU_TRUEHDR_RUNTIME"]
+fn nvidia_cached_frame_with_one_slot_preserves_in_flight_output() {
+    let mut config = settings();
+    config.runtime_directory = std::env::var_os("AMATERASU_TRUEHDR_RUNTIME")
+        .expect("runtime path")
+        .into();
+    config.output_buffers = 1;
+    let stream = Stream::open(&config, 512, 288, None).unwrap();
     let source = Source::new(stream.slots[0].session.clone());
+    let mut processor = Processor::new(config);
+    processor.streams.insert(77, stream);
+    let raw = into_gpu_binding(processor);
+    let api = unsafe { &*raw };
+    let initial = source.lease();
+    let mut held = None;
+    assert_eq!(
+        unsafe {
+            process_gpu(api, 77, &initial, CAPTURE_FRAME_FRESH, |output| {
+                assert_eq!(output.retain.unwrap()(output.context), STATUS_OK);
+                held = Some(*output);
+                STATUS_OK
+            })
+        },
+        ProcessingOutcome::Accepted
+    );
+    let held = held.unwrap();
+    assert_eq!(
+        unsafe {
+            process_gpu(api, 77, &initial, CAPTURE_FRAME_CACHED_REUSE, |output| {
+                assert_eq!(output.context, held.context);
+                STATUS_OK
+            })
+        },
+        ProcessingOutcome::Accepted
+    );
+    let mut changed = initial;
+    changed.frame.sequence += 1;
+    assert_eq!(
+        unsafe { process_gpu(api, 77, &changed, CAPTURE_FRAME_FRESH, |_| STATUS_OK) },
+        ProcessingOutcome::Busy
+    );
+    unsafe { held.release.unwrap()(held.context, -1) };
+    assert_eq!(
+        unsafe { process_gpu(api, 77, &changed, CAPTURE_FRAME_FRESH, |_| STATUS_OK) },
+        ProcessingOutcome::Accepted
+    );
+    unsafe {
+        (api.cancel_dmabuf_leases)(api.base.context, 77);
+        api.base.release.unwrap()(api.base.context);
+    }
+}
+
+#[test]
+#[ignore = "requires an NVIDIA RTX GPU and AMATERASU_TRUEHDR_RUNTIME pointing to the licensed VFX runtime"]
+fn nvidia_interop_orders_distinct_frames_without_intermediate_readback() {
+    let mut config = settings();
+    config.runtime_directory = std::env::var_os("AMATERASU_TRUEHDR_RUNTIME")
+        .expect("runtime path")
+        .into();
+    config.output_buffers = 2;
+    let stream = Stream::open(&config, 512, 288, None).unwrap();
+    let session = stream.slots[0].session.clone();
+    let pattern = Source::new(session.clone());
+    let white = Source::new(session.clone());
+    assert_eq!(
+        unsafe { am_rtx_test_fill_source(session.0.as_ptr(), white.raw, 1.0, 1.0, 1.0) },
+        0
+    );
+    let mut processor = Processor::new(config);
+    processor.streams.insert(77, stream);
+    let raw = into_gpu_binding(processor);
+    let api = unsafe { &*raw };
+    let native_fence = unsafe { am_rtx_test_native_fence_available(session.0.as_ptr()) } != 0;
+    eprintln!("RTX HDR native completion fence available: {native_fence}");
+    for round in 0..16 {
+        if round == 8 {
+            // Also qualify the existing GL completion fallback on this GPU.
+            unsafe { am_rtx_test_disable_native_fence(session.0.as_ptr()) };
+        }
+        let mut outputs = Vec::new();
+        for source in [&pattern, &white] {
+            assert_eq!(
+                unsafe {
+                    process_gpu(api, 77, &source.lease(), CAPTURE_FRAME_FRESH, |output| {
+                        assert_eq!(output.retain.unwrap()(output.context), STATUS_OK);
+                        outputs.push(*output);
+                        STATUS_OK
+                    })
+                },
+                ProcessingOutcome::Accepted
+            );
+        }
+        // The pattern's right-hand side is black. The second source is white.
+        // Read only after both conversions, exercising interop ordering across
+        // resource reuse as well as immutable output ownership.
+        let first = read(&outputs[0]);
+        let second = read(&outputs[1]);
+        assert!(nits(first[511] & 1023) < 0.01);
+        assert!(nits(second[511] & 1023) > 400.0);
+        for output in outputs {
+            unsafe { output.release.unwrap()(output.context, -1) };
+        }
+    }
+    unsafe {
+        (api.cancel_dmabuf_leases)(api.base.context, 77);
+        api.base.release.unwrap()(api.base.context);
+    }
+}
+
+#[test]
+#[ignore = "requires an NVIDIA RTX GPU and AMATERASU_TRUEHDR_RUNTIME pointing to the licensed VFX runtime"]
+fn nvidia_sdk_toggle_from_disabled_preserves_frames_and_hdr_output() {
+    for scope in ["global", "application"] {
+        verify_gpu_toggle(scope, None);
+    }
+}
+
+#[test]
+#[ignore = "requires an NVIDIA RTX GPU and AMATERASU_TRUEHDR_RUNTIME pointing to the licensed VFX runtime"]
+fn nvidia_ten_bit_sdr_application_converts_and_preserves_held_frames() {
+    for format in [*b"AR30", *b"AB30"] {
+        verify_gpu_toggle("application", Some(u32::from_le_bytes(format)));
+    }
+}
+
+fn verify_gpu_toggle(scope: &str, format: Option<u32>) {
+    let mut config = settings();
+    config.runtime_directory = std::env::var_os("AMATERASU_TRUEHDR_RUNTIME")
+        .expect("runtime path")
+        .into();
+    config.output_buffers = 2;
+    let stream = Stream::open(&config, 512, 288, None).unwrap();
+    let source = Source::new_format(stream.slots[0].session.clone(), format);
     let mut processor = Processor::new(config);
     let (mut controls, _) = intent_settings();
     controls["rtx_hdr_enable"] = false.into();
+    controls["rtx_hdr_scope"] = scope.into();
+    let enable_key = if scope == "application" {
+        "rtx_hdr_application_enable"
+    } else {
+        "rtx_hdr_enable"
+    };
     processor
         .configure_stream(77, &serde_json::to_vec(&controls).unwrap())
         .unwrap();
@@ -374,8 +726,9 @@ fn nvidia_sdk_toggle_from_disabled_preserves_frames_and_hdr_output() {
     );
     let held = held.unwrap();
     assert!((nits(fallback[300] & 1023) - 100.0).abs() < 3.0);
+    let mut converted = None;
     for enabled in [true, false, true, false] {
-        controls["rtx_hdr_enable"] = enabled.into();
+        controls[enable_key] = enabled.into();
         assert_eq!(
             unsafe { update_gpu_stream(api, 77, &serde_json::to_vec(&controls).unwrap()) },
             Ok(())
@@ -396,6 +749,11 @@ fn nvidia_sdk_toggle_from_disabled_preserves_frames_and_hdr_output() {
         let white = nits(pixels[300] & 1023);
         if enabled {
             assert!(white > 900.0, "conversion white: {white}");
+            if let Some(expected) = &converted {
+                assert_eq!(&pixels, expected, "conversion changed on repeated enable");
+            } else {
+                converted = Some(pixels);
+            }
         } else {
             assert_eq!(pixels, fallback);
         }

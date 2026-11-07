@@ -75,12 +75,16 @@ struct Surface {
     PFNEGLCREATEIMAGEKHRPROC create_image = nullptr;
     PFNEGLDESTROYIMAGEKHRPROC destroy_image = nullptr;
     PFNGLEGLIMAGETARGETTEXTURE2DOESPROC bind_image = nullptr;
+    PFNEGLCREATESYNCKHRPROC create_sync = nullptr;
+    PFNEGLDESTROYSYNCKHRPROC destroy_sync = nullptr;
+    PFNEGLDUPNATIVEFENCEFDANDROIDPROC duplicate_fence = nullptr;
     GLuint input = 0, output = 0, input_fbo = 0, output_fbo = 0;
     GLuint source = 0, program = 0, output_program = 0, fallback_program = 0, vao = 0;
     void open(CUdevice device);
     void prepare(uint32_t width, uint32_t height);
     EGLImageKHR import(const AmaterasuDmaBufFrame &frame);
     void capture(const AmaterasuDmaBufFrame &frame);
+    void finish();
     void close();
 };
 

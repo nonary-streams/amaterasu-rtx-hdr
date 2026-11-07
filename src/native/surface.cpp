@@ -101,6 +101,12 @@ void Surface::open(CUdevice cuda_device) {
         eglGetProcAddress("glEGLImageTargetTexture2DOES"));
     if (!create_image || !destroy_image || !bind_image)
         throw std::runtime_error("EGL image functions unavailable");
+    if (extension(extensions, "EGL_ANDROID_native_fence_sync")) {
+        create_sync = reinterpret_cast<PFNEGLCREATESYNCKHRPROC>(eglGetProcAddress("eglCreateSyncKHR"));
+        destroy_sync = reinterpret_cast<PFNEGLDESTROYSYNCKHRPROC>(eglGetProcAddress("eglDestroySyncKHR"));
+        duplicate_fence = reinterpret_cast<PFNEGLDUPNATIVEFENCEFDANDROIDPROC>(
+            eglGetProcAddress("eglDupNativeFenceFDANDROID"));
+    }
     const EGLenum previous_api = eglQueryAPI();
     if (!eglBindAPI(EGL_OPENGL_API))
         throw std::runtime_error("desktop OpenGL unavailable");
@@ -294,7 +300,9 @@ void Surface::capture(const AmaterasuDmaBufFrame &frame) {
         glUseProgram(program);
         glBindVertexArray(vao);
         glDrawArrays(GL_TRIANGLES, 0, 3);
-        glFinish();
+        // The input texture is consumed either by CUDA graphics-map or by the
+        // fallback GL draw in this same context. Both preserve this dependency.
+        // The final output completion wait still completes every borrowed input read.
         gl_check("effect source sampling failed");
     } catch (...) {
         glFinish();
@@ -302,6 +310,39 @@ void Surface::capture(const AmaterasuDmaBufFrame &frame) {
         throw;
     }
     destroy_image(display, image);
+}
+
+void Surface::finish() {
+    // A native sync_file lets the calling thread sleep while the GPU finishes.
+    // This fence is inserted after the input read and output draw, and the CUDA
+    // unmap orders the model's writes before that draw. If native fences are
+    // unavailable, preserve the existing synchronous GL completion barrier.
+    if (!create_sync || !destroy_sync || !duplicate_fence) {
+        glFinish();
+        return;
+    }
+    EGLSyncKHR sync = create_sync(display, EGL_SYNC_NATIVE_FENCE_ANDROID, nullptr);
+    if (sync == EGL_NO_SYNC_KHR) {
+        glFinish();
+        return;
+    }
+    glFlush();
+    int fd = duplicate_fence(display, sync);
+    destroy_sync(display, sync);
+    if (fd < 0) {
+        glFinish();
+        return;
+    }
+    try {
+        wait_fence(fd);
+    } catch (...) {
+        ::close(fd);
+        // The fence is only an optimization. If it cannot prove completion,
+        // retain the original GL barrier before lending or reusing pixels.
+        glFinish();
+        return;
+    }
+    ::close(fd);
 }
 
 void Surface::close() {

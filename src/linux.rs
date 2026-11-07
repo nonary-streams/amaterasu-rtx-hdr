@@ -78,13 +78,46 @@ impl Drop for Slot {
 }
 struct Stream {
     slots: Vec<Rc<Slot>>,
+    cached: Option<CachedOutput>,
     width: u32,
     height: u32,
     enabled: bool,
+    reported_enabled: Option<bool>,
 }
 struct Lease {
     slot: Rc<Slot>,
     references: Cell<u32>,
+}
+
+/// One reference keeps the most recent immutable result available for capture
+/// retries and keepalives. The cache owns a regular output lease, so downstream
+/// references continue to protect the same slot after the cache is replaced.
+struct CachedOutput {
+    lease: DmaBufFrameLease,
+    input_sequence: u64,
+}
+
+impl CachedOutput {
+    fn deliver(&self, input: &DmaBufFrame) -> Result<GpuOutputFrame, Status> {
+        let mut lease = self.lease;
+        lease.frame.sequence = input.sequence;
+        lease.frame.timestamp_us = input.timestamp_us;
+        // SAFETY: the cache owns a live reference throughout this retain.
+        let status = unsafe { retain(lease.context) };
+        if status != STATUS_OK {
+            return Err(status);
+        }
+        // SAFETY: the successful retain transfers one independent reference;
+        // the cache and any downstream owners keep the slot immutable.
+        unsafe { GpuOutputFrame::from_owned_lease(lease) }
+    }
+}
+
+impl Drop for CachedOutput {
+    fn drop(&mut self) {
+        // SAFETY: constructing the cache transferred exactly one reference.
+        unsafe { release(self.lease.context, -1) };
+    }
 }
 
 unsafe extern "C" fn retain(context: *mut c_void) -> Status {
@@ -184,9 +217,11 @@ impl Stream {
         }
         Ok(Self {
             slots,
+            cached: None,
             width,
             height,
             enabled: true,
+            reported_enabled: None,
         })
     }
 
@@ -215,22 +250,36 @@ impl Stream {
     }
 
     fn configure(
-        &self,
+        &mut self,
         settings: &Settings,
         enabled: bool,
         logger: Option<&amaterasu_module_sdk::LogEmitter>,
     ) -> Result<(), Status> {
-        Self::configure_session(&self.slots[0].session, settings, enabled, logger)
+        Self::configure_session(&self.slots[0].session, settings, enabled, logger)?;
+        // A live settings or foreground change can alter pixels even if the
+        // capture provider keeps presenting the same source frame.
+        self.cached = None;
+        Ok(())
     }
 
     fn process(
-        &self,
+        &mut self,
         input: &DmaBufFrame,
+        freshness: u32,
         logger: Option<&amaterasu_module_sdk::LogEmitter>,
     ) -> Result<GpuOutputFrame, Status> {
         if input.width != self.width || input.height != self.height {
             return Err(MEDIA_UNSUPPORTED);
         }
+        if freshness == CAPTURE_FRAME_CACHED_REUSE
+            && let Some(cached) = self.cached.as_ref()
+            && cached.input_sequence == input.sequence
+        {
+            return cached.deliver(input);
+        }
+        // Free the cache's reference before finding a slot. In-flight encoder
+        // references still protect old output until they are retired.
+        self.cached = None;
         let slot = self
             .slots
             .iter()
@@ -261,16 +310,19 @@ impl Stream {
             slot: slot.clone(),
             references: Cell::new(1),
         });
-        // SAFETY: transfers the initial reference. The box keeps the immutable
-        // slot/session alive; retain/release are bounded and own completion fds.
-        unsafe {
-            GpuOutputFrame::from_owned_lease(DmaBufFrameLease {
+        self.cached = Some(CachedOutput {
+            lease: DmaBufFrameLease {
                 frame,
                 context: Box::into_raw(lease).cast(),
                 retain: Some(retain),
                 release: Some(release),
-            })
-        }
+            },
+            input_sequence: input.sequence,
+        });
+        self.cached
+            .as_ref()
+            .expect("cache was populated")
+            .deliver(input)
     }
 
     fn assert_retired(&self) {
@@ -413,6 +465,21 @@ impl GpuFrameProcessor for Processor {
         }
         let frame = input.frame();
         if !supported_input(frame) {
+            if let Some(logger) = &self.logger {
+                let message = serde_json::json!({
+                    "event": "rtx_hdr_input_rejected",
+                    "stream": stream,
+                    "width": frame.width,
+                    "height": frame.height,
+                    "color": frame.color,
+                    "fourcc": frame.fourcc,
+                    "planes": frame.plane_count,
+                    "pitch": frame.planes[0].pitch,
+                    "offset": frame.planes[0].offset,
+                })
+                .to_string();
+                let _ = logger.emit(amaterasu_module_sdk::LogLevel::Error, "rtx-hdr", &message);
+            }
             return Err(MEDIA_UNSUPPORTED);
         }
         if !self.streams.contains_key(&stream) {
@@ -457,13 +524,32 @@ impl GpuFrameProcessor for Processor {
             active.configure(settings, enabled, self.logger.as_ref())?;
             active.enabled = enabled;
         }
-        active.process(frame, self.logger.as_ref())
+        let output = active.process(frame, input.freshness(), self.logger.as_ref())?;
+        if active.reported_enabled != Some(enabled) {
+            if let Some(logger) = &self.logger {
+                let message = serde_json::json!({
+                    "event": "rtx_hdr_conversion",
+                    "stream": stream,
+                    "enabled": enabled,
+                    "width": frame.width,
+                    "height": frame.height,
+                    "peak_nits": settings.peak_luminance,
+                    "source": "srgb",
+                    "output": "bt2020_pq",
+                })
+                .to_string();
+                let _ = logger.emit(amaterasu_module_sdk::LogLevel::Info, "rtx-hdr", &message);
+            }
+            active.reported_enabled = Some(enabled);
+        }
+        Ok(output)
     }
     fn cancel(&mut self, stream: u64) {
         self.set_demand(stream, false);
         self.stream_settings.remove(&stream);
         self.targets.remove(&stream);
-        if let Some(active) = self.streams.remove(&stream) {
+        if let Some(mut active) = self.streams.remove(&stream) {
+            active.cached = None;
             active.assert_retired();
         }
         if self.retired.len() < 1024 {
@@ -471,7 +557,8 @@ impl GpuFrameProcessor for Processor {
         }
     }
     fn shutdown(&mut self) {
-        for stream in self.streams.values() {
+        for stream in self.streams.values_mut() {
+            stream.cached = None;
             stream.assert_retired();
         }
         self.streams.clear();
@@ -489,12 +576,14 @@ impl GpuFrameProcessor for Processor {
     }
 }
 
+/// SDR scanout may use either eight-bit or ten-bit packed RGB. EGL samples
+/// both into the same RGBA8 model input; bit depth does not imply HDR transfer.
 fn supported_input(frame: &DmaBufFrame) -> bool {
     frame.color == DMABUF_COLOR_SRGB
         && frame.plane_count == 1
         && matches!(
             frame.fourcc.to_le_bytes(),
-            [b'X' | b'A', b'R' | b'B', b'2', b'4']
+            [b'X' | b'A', b'R' | b'B', b'2', b'4'] | [b'X' | b'A', b'R' | b'B', b'3', b'0']
         )
         && (16..=8192).contains(&frame.width)
         && (16..=8192).contains(&frame.height)

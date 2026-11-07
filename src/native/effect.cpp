@@ -119,7 +119,11 @@ void Session::run(const AmaterasuDmaBufFrame &frame, Output &destination) {
         copy_texture(*api, stream, input_resource, input, true);
         vfx_check(api->run_effect(effect, 0), "run TrueHDR");
         copy_texture(*api, stream, output_resource, output, false);
-        cuda_check(api->synchronize_stream(stream), "complete TrueHDR conversion");
+        // Unmapping the output resource orders all earlier CUDA work on this
+        // stream before the following GL draw. Let GL wait on the GPU instead
+        // of also blocking the calling thread at cuStreamSynchronize. The
+        // final completion wait still retires both the borrowed input and the
+        // output before either can be reused by another provider.
     }
     glBindFramebuffer(GL_FRAMEBUFFER, destination.fbo);
     glViewport(0, 0, input.width, input.height);
@@ -135,7 +139,7 @@ void Session::run(const AmaterasuDmaBufFrame &frame, Output &destination) {
                     100.0f + sdr_brightness);
     }
     glDrawArrays(GL_TRIANGLES, 0, 3);
-    glFinish();
+    surface.finish();
     if (glGetError() != GL_NO_ERROR)
         throw std::runtime_error("HDR output copy failed");
 }
