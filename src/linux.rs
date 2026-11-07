@@ -59,7 +59,32 @@ unsafe extern "C" {
     ) -> i32;
     fn am_rtx_wait_fence(fd: i32) -> i32;
     fn am_rtx_context_priority(context: *mut c_void) -> i32;
+    fn am_rtx_take_timing(context: *mut c_void, totals: *mut GpuTiming);
 }
+
+/// Mirrors `rtx::TimingTotals`: GPU-clock stage times summed over a window.
+#[repr(C)]
+#[derive(Default, serde::Serialize)]
+struct GpuTiming {
+    samples: u64,
+    slow_frames: u64,
+    queue_us: u64,
+    queue_max_us: u64,
+    sample_us: u64,
+    sample_max_us: u64,
+    model_us: u64,
+    model_max_us: u64,
+    model_run_us: u64,
+    model_run_max_us: u64,
+    output_us: u64,
+    output_max_us: u64,
+    total_us: u64,
+    total_max_us: u64,
+}
+const _: () = assert!(std::mem::size_of::<GpuTiming>() == 14 * 8);
+
+/// Matches the host's other stage windows so the logs line up.
+const TIMING_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
 
 struct NativeSession(NonNull<c_void>);
 impl Drop for NativeSession {
@@ -92,6 +117,7 @@ impl Drop for Slot {
 }
 struct Stream {
     slots: Vec<Rc<Slot>>,
+    timing_reported: std::time::Instant,
     cached: Option<CachedOutput>,
     pending_inputs: VecDeque<PendingInput>,
     width: u32,
@@ -304,6 +330,7 @@ impl Stream {
         report_context_priority(&session, logger);
         Ok(Self {
             slots,
+            timing_reported: std::time::Instant::now(),
             cached: None,
             pending_inputs: VecDeque::new(),
             width,
@@ -360,6 +387,7 @@ impl Stream {
             return Err(MEDIA_UNSUPPORTED);
         }
         self.retire_completed_inputs();
+        self.report_timing(logger);
         if source.freshness() == CAPTURE_FRAME_CACHED_REUSE
             && let Some(cached) = self.cached.as_ref()
             && cached.input_sequence == input.sequence
@@ -505,6 +533,28 @@ impl Stream {
         {
             self.pending_inputs.pop_front();
         }
+    }
+
+    /// Logs the window's GPU stage times. Reading never waits for the GPU.
+    fn report_timing(&mut self, logger: Option<&amaterasu_module_sdk::LogEmitter>) {
+        let (Some(logger), Some(slot)) = (logger, self.slots.first()) else {
+            return;
+        };
+        if self.timing_reported.elapsed() < TIMING_WINDOW {
+            return;
+        }
+        self.timing_reported = std::time::Instant::now();
+        let mut timing = GpuTiming::default();
+        // SAFETY: the session is live and the record has the C layout.
+        unsafe { am_rtx_take_timing(slot.session.0.as_ptr(), &mut timing) };
+        let mut message = serde_json::to_value(&timing).unwrap_or_default();
+        message["event"] = "rtx_hdr_gpu_timing".into();
+        message["scope"] = "gpu_clock_submit_to_output_written".into();
+        let _ = logger.emit(
+            amaterasu_module_sdk::LogLevel::Info,
+            "rtx-hdr",
+            &message.to_string(),
+        );
     }
 
     fn retire_inputs(&mut self) {

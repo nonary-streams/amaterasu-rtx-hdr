@@ -46,6 +46,7 @@ Session::Session(const std::string &root, int ordinal, uint32_t width, uint32_t 
         // VFX/NGX also performs initialization on CUDA's legacy default stream.
         // Match NvVFX_CudaStreamCreate's default-stream ordering semantics.
         cuda_check(api->create_stream(&stream, CU_STREAM_DEFAULT), "create effect stream");
+        timing.open(*api);
         vfx_check(api->allocate(&input, width, height, 6, 1, 0, 1, 1), "allocate RGBA8 input");
         vfx_check(api->allocate(&output, width, height, 13, 11, 0, 1, 1),
                   "allocate RGB10A2 output");
@@ -117,9 +118,14 @@ void Session::configure(const uint32_t *values, bool active, uint32_t brightness
 }
 
 int Session::run(const AmaterasuDmaBufFrame &frame, Output &destination) {
+    timing.begin(*api);
+    surface.wait_acquire(frame.planes[0].acquire_fence_fd);
+    timing.started();
     surface.capture(frame);
+    timing.sampled();
     if (enabled)
         convert();
+    timing.resumed();
     glBindFramebuffer(GL_FRAMEBUFFER, destination.fbo);
     glViewport(0, 0, input.width, input.height);
     glUseProgram(enabled ? surface.output_program : surface.fallback_program);
@@ -134,6 +140,7 @@ int Session::run(const AmaterasuDmaBufFrame &frame, Output &destination) {
                     100.0f + sdr_brightness);
     }
     glDrawArrays(GL_TRIANGLES, 0, 3);
+    timing.finished();
     if (glGetError() != GL_NO_ERROR)
         throw std::runtime_error("HDR output copy failed");
     return surface.complete();
@@ -148,9 +155,11 @@ void Session::convert() {
     CUgraphicsResource resources[] = {input_resource, output_resource};
     cuda_check(api->map(2, resources, stream), "map effect textures");
     try {
+        timing.model_queued(*api, stream, true);
         copy_array(*api, stream, mapped_array(*api, input_resource), input, true);
         vfx_check(api->run_effect(effect, 1), "run TrueHDR");
         copy_array(*api, stream, mapped_array(*api, output_resource), output, false);
+        timing.model_queued(*api, stream, false);
     } catch (...) {
         if (api->unmap(2, resources, stream) != CUDA_SUCCESS)
             std::abort();
@@ -165,6 +174,7 @@ void Session::close() {
             Current current(*api, surface, context);
             if (stream)
                 cuda_check(api->synchronize_stream(stream), "retire effect stream");
+            timing.close(*api);
             if (input_resource)
                 cuda_check(api->unregister_image(input_resource), "retire effect input");
             if (output_resource)

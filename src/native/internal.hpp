@@ -45,6 +45,11 @@ struct Api {
     decltype(&cuGraphicsUnmapResources) unmap;
     decltype(&cuGraphicsSubResourceGetMappedArray) mapped_array;
     decltype(&cuMemcpy2DAsync) copy;
+    decltype(&cuEventCreate) create_event;
+    decltype(&cuEventDestroy) destroy_event;
+    decltype(&cuEventRecord) record_event;
+    decltype(&cuEventQuery) query_event;
+    decltype(&cuEventElapsedTime) elapsed_time;
     int (*allocate)(Image *, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned);
     void (*deallocate)(Image *);
     int (*create_effect)(const char *, void **);
@@ -91,6 +96,47 @@ struct Surface {
     void close();
 };
 
+/* GPU-clock stage times summed since the last take. Mirrored in linux.rs. */
+struct TimingTotals {
+    uint64_t samples, slow_frames;
+    uint64_t queue_us, queue_max_us;   /* submit until the GPU starts sampling */
+    uint64_t sample_us, sample_max_us; /* input sampling draw */
+    uint64_t model_us, model_max_us;   /* sampled until GL resumes after CUDA */
+    uint64_t model_run_us, model_run_max_us; /* CUDA execution of the model */
+    uint64_t output_us, output_max_us; /* PQ output draw */
+    uint64_t total_us, total_max_us;   /* submit until the output is written */
+};
+static_assert(sizeof(TimingTotals) == 14 * sizeof(uint64_t));
+
+/* Timestamps for a few frames in flight. Results are read only once ready,
+ * so measuring never makes the processing thread wait for the GPU. */
+class Timing {
+  public:
+    void open(Api &api);
+    void close(Api &api);
+    bool begin(Api &api);
+    void started();
+    void sampled();
+    void model_queued(Api &api, CUstream stream, bool before);
+    void resumed();
+    void finished();
+    TimingTotals take(Api &api);
+
+  private:
+    struct Frame {
+        GLuint queries[4]{};
+        CUevent events[2]{};
+        GLint64 submitted = 0;
+        bool pending = false, modeled = false;
+    };
+    void reap(Api &api);
+    std::array<Frame, 4> frames{};
+    Frame *current = nullptr;
+    size_t next = 0;
+    bool available = false;
+    TimingTotals totals{};
+};
+
 struct Current {
     Api &api;
     Surface &surface;
@@ -122,6 +168,7 @@ struct Session {
     void *effect = nullptr;
     CUgraphicsResource input_resource = nullptr, output_resource = nullptr;
     bool retained_context = false;
+    Timing timing;
     bool enabled = true;
     uint32_t sdr_brightness = 0;
     std::array<uint32_t, 5> parameters{};
@@ -145,4 +192,5 @@ int am_rtx_process(void *, const AmaterasuDmaBufFrame *, void *, int *, char *, 
 int am_rtx_configure(void *, const uint32_t *, bool, uint32_t, char *, size_t);
 int am_rtx_wait_fence(int);
 int am_rtx_context_priority(void *);
+void am_rtx_take_timing(void *, rtx::TimingTotals *);
 }

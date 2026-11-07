@@ -58,6 +58,11 @@ std::shared_ptr<Api> Api::load(const std::string &root) {
     CUDA_MEMBER(unmap, "cuGraphicsUnmapResources");
     CUDA_MEMBER(mapped_array, "cuGraphicsSubResourceGetMappedArray");
     CUDA_MEMBER(copy, "cuMemcpy2DAsync_v2");
+    CUDA_MEMBER(create_event, "cuEventCreate");
+    CUDA_MEMBER(destroy_event, "cuEventDestroy_v2");
+    CUDA_MEMBER(record_event, "cuEventRecord");
+    CUDA_MEMBER(query_event, "cuEventQuery");
+    CUDA_MEMBER(elapsed_time, "cuEventElapsedTime_v2");
 #undef CUDA_MEMBER
     // Keep NVIDIA's wheel layout. Resolve its private shared-library dependency
     // graph in bounded passes; do not change process environment/search paths.
@@ -241,6 +246,16 @@ extern "C" int am_rtx_configure(void *context, const uint32_t *parameters, bool 
     } catch (const std::exception &failure) {
         report(error, capacity, failure);
         return -1;
+    }
+}
+extern "C" void am_rtx_take_timing(void *context, rtx::TimingTotals *totals) {
+    auto &session = *static_cast<rtx::Session *>(context);
+    *totals = {};
+    try {
+        rtx::Current current(*session.api, session.surface, session.context);
+        *totals = session.timing.take(*session.api);
+    } catch (...) {
+        // Diagnostics never fail the stream; report an empty window.
     }
 }
 extern "C" int am_rtx_context_priority(void *context) {

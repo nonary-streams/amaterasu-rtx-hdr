@@ -30,6 +30,7 @@ fn main() {
         .file("src/native/runtime.cpp")
         .file("src/native/surface.cpp")
         .file("src/native/effect.cpp")
+        .file("src/native/timing.cpp")
         .file("src/native/test_support.cpp")
         .compile("amaterasu_rtx_hdr");
     println!("cargo:rustc-link-lib=dl");

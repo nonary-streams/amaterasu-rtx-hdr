@@ -331,8 +331,8 @@ void Surface::wait_acquire(int fence_fd) {
     wait_fence(fence_fd);
 }
 
+// The caller has already queued the producer's acquire-fence wait.
 void Surface::capture(const AmaterasuDmaBufFrame &frame) {
-    wait_acquire(frame.planes[0].acquire_fence_fd);
     auto image = import(frame);
     try {
         glActiveTexture(GL_TEXTURE0);

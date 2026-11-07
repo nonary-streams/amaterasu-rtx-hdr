@@ -1223,3 +1223,60 @@ fn nvidia_without_native_fences_completes_before_returning() {
         api.base.release.unwrap()(api.base.context);
     }
 }
+
+#[test]
+#[ignore = "requires an NVIDIA RTX GPU and AMATERASU_TRUEHDR_RUNTIME"]
+fn nvidia_reports_gpu_stage_timing_without_waiting() {
+    let mut config = settings();
+    config.runtime_directory = std::env::var_os("AMATERASU_TRUEHDR_RUNTIME")
+        .expect("runtime path")
+        .into();
+    let width = std::env::var("AMATERASU_RTX_BENCH_WIDTH")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(512);
+    let height = std::env::var("AMATERASU_RTX_BENCH_HEIGHT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(288);
+    let stream = Stream::open(&config, width, height, None).unwrap();
+    let session = stream.slots[0].session.clone();
+    let source = Source::new(session.clone());
+    let mut processor = Processor::new(config);
+    processor.streams.insert(77, stream);
+    let raw = into_gpu_binding(processor);
+    let api = unsafe { &*raw };
+    for sequence in 1..=60 {
+        let mut lease = source.lease();
+        lease.frame.sequence = sequence;
+        let result = unsafe {
+            process_gpu(api, 77, &lease, CAPTURE_FRAME_FRESH, |output| {
+                // Paced like a stream: consume each output before the next.
+                let fence = output.frame.planes[0].acquire_fence_fd;
+                assert_eq!(am_rtx_wait_fence(fence), 0);
+                STATUS_OK
+            })
+        };
+        assert_eq!(result, ProcessingOutcome::Accepted);
+        std::thread::sleep(std::time::Duration::from_millis(8));
+    }
+    let mut timing = GpuTiming::default();
+    unsafe { am_rtx_take_timing(session.0.as_ptr(), &mut timing) };
+    eprintln!(
+        "RTX HDR GPU timing {width}x{height}: {}",
+        serde_json::to_string(&timing).unwrap()
+    );
+    assert!(
+        timing.samples >= 50,
+        "timed {} of 60 frames",
+        timing.samples
+    );
+    assert!(timing.model_run_us > 0, "CUDA model execution is timed");
+    assert!(timing.total_us >= timing.sample_us + timing.output_us);
+    drop(source);
+    drop(session);
+    unsafe {
+        (api.cancel_dmabuf_leases)(api.base.context, 77);
+        api.base.release.unwrap()(api.base.context);
+    }
+}
