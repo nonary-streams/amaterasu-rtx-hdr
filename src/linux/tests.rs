@@ -35,6 +35,7 @@ fn intent_settings() -> (serde_json::Value, serde_json::Value) {
     )
     .unwrap();
     settings["rtx_hdr_enable"] = true.into();
+    settings["rtx_hdr_scope"] = "global".into();
     settings["rtx_hdr_peak_brightness"] = 1000.into();
     let target = serde_json::json!({"kind":"stream","host_epoch":"epoch","session_id":"session","stream_id":"stream","generation":1});
     let request = serde_json::json!({"method":"processing_intent","interface_major":1,"interface_minor":0,"arguments":{"target":target,"revision":"snapshot","settings":settings}});

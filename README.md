@@ -101,6 +101,13 @@ the effect and fails an incompatible stream without skipping processing.
 
 ## Foreground policy
 
+RTX HDR defaults to per-application scope. Opt in from an application's RTX
+HDR settings, or select global scope and enable RTX HDR in the host settings.
+These choices apply to the next stream. When selected, RTX HDR forces an SDR
+capture source and converts it to HDR output; the client must request HDR.
+An SDR request is rejected while conversion is selected. Unselected streams
+do not route through the RTX processor.
+
 `rtx_hdr_foreground_only` and `rtx_hdr_fullscreen_only` default to false. When
 foreground matching is enabled, the plugin applies
 TrueHDR only while the selected foreground provider reports the exact executable

@@ -7,7 +7,8 @@ window.AmaterasuExtensions.v1.register('rtx-hdr', {
       throw new Error('RTX HDR requires application settings support.');
     }
     const parameters = [
-      ['rtx_hdr_enable', 'Enable RTX HDR', 'boolean', null, null],
+      ['rtx_hdr_enable', 'Override RTX HDR in global mode', 'boolean', null, null],
+      ['rtx_hdr_application_enable', 'Enable RTX HDR for this application', 'boolean', null, null],
       ['rtx_hdr_peak_brightness', 'Peak brightness (nits)', 'integer', 400, 2000],
       ['rtx_hdr_middle_gray', 'Middle gray', 'integer', 10, 100],
       ['rtx_hdr_contrast', 'Contrast', 'integer', -100, 100],
@@ -21,7 +22,7 @@ window.AmaterasuExtensions.v1.register('rtx-hdr', {
     const status = document.createElement('p');
     status.setAttribute('role', 'status');
     const help = document.createElement('p');
-    help.textContent = 'Changes save automatically. RTX HDR and tuning update active HDR streams after saving. Turning it off preserves SDR appearance within the HDR stream.';
+    help.textContent = 'Changes save automatically. Application opt-in applies to the next stream in per-application mode. RTX HDR forces an SDR source and converts it to HDR; the client must request HDR. Tuning updates active HDR streams.';
     const controls = new Map();
     let documentState;
     let draft = {};

@@ -157,6 +157,10 @@ mod tests {
 #[serde(deny_unknown_fields)]
 pub struct StreamSettings {
     pub rtx_hdr_enable: bool,
+    #[serde(default = "legacy_global_scope")]
+    pub rtx_hdr_scope: String,
+    #[serde(default)]
+    pub rtx_hdr_application_enable: bool,
     pub rtx_hdr_peak_brightness: u32,
     pub rtx_hdr_middle_gray: u32,
     pub rtx_hdr_contrast: i32,
@@ -173,6 +177,10 @@ pub struct StreamSettings {
     pub foreground_target: Option<amaterasu_module_sdk::extension_api::LifecycleTarget>,
 }
 
+fn legacy_global_scope() -> String {
+    "global".into()
+}
+
 impl StreamSettings {
     pub fn apply(&self, startup: &Settings) -> Result<Settings, &'static str> {
         if !(-100..=100).contains(&self.rtx_hdr_contrast)
@@ -181,7 +189,11 @@ impl StreamSettings {
             return Err("invalid RTX HDR stream settings");
         }
         let mut configured = startup.clone();
-        configured.enabled = self.rtx_hdr_enable;
+        configured.enabled = match self.rtx_hdr_scope.as_str() {
+            "global" => self.rtx_hdr_enable,
+            "application" => self.rtx_hdr_application_enable,
+            _ => return Err("invalid RTX HDR scope"),
+        };
         configured.contrast = (self.rtx_hdr_contrast + 100) as u32;
         configured.saturation = (self.rtx_hdr_saturation + 100) as u32;
         configured.middle_gray = self.rtx_hdr_middle_gray;
@@ -198,6 +210,26 @@ impl StreamSettings {
 #[cfg(test)]
 mod stream_settings_tests {
     use super::*;
+
+    #[test]
+    fn conversion_scope_selects_global_or_application_enablement() {
+        let startup: Settings =
+            serde_json::from_value(serde_json::json!({"runtime_directory":"/trusted"})).unwrap();
+        let mut values =
+            amaterasu_configuration_schema::defaults(&crate::settings_descriptor::definitions())
+                .unwrap();
+        values.insert("rtx_hdr_enable".into(), true.into());
+        let mut controls: StreamSettings =
+            serde_json::from_value(serde_json::json!(values)).unwrap();
+        assert!(!controls.apply(&startup).unwrap().enabled);
+        controls.rtx_hdr_application_enable = true;
+        assert!(controls.apply(&startup).unwrap().enabled);
+        controls.rtx_hdr_scope = "global".into();
+        controls.rtx_hdr_application_enable = false;
+        assert!(controls.apply(&startup).unwrap().enabled);
+        controls.rtx_hdr_enable = false;
+        assert!(!controls.apply(&startup).unwrap().enabled);
+    }
 
     #[test]
     fn stream_controls_cannot_change_trusted_runtime_and_are_bounded() {

@@ -175,15 +175,13 @@ pub(crate) fn handle(caller: &str, selected: &Selection, payload: Value) -> Valu
             .and_then(|response| serde_json::to_value(response).map_err(|error| error.to_string()))
             .unwrap_or_else(|_| rejected("invalid_join_context"));
     }
-    let processing_requirement = if request
-        .requested_video
-        .as_ref()
-        .is_some_and(|video| video.hdr)
-        || request
-            .settings
-            .get("rtx_hdr_enable")
-            .and_then(Value::as_bool)
-            == Some(true)
+    let settings = json!(request.settings);
+    let processing_requirement = if conversion_enabled(&settings)
+        || (settings["rtx_hdr_scope"] == "global"
+            && request
+                .requested_video
+                .as_ref()
+                .is_some_and(|video| video.hdr))
     {
         json!({"source_hdr_required":false, "output_hdr_required":true})
     } else {
@@ -239,14 +237,22 @@ pub(crate) fn intent_registration() -> Command {
             service: crate::settings_descriptor::SERVICE.into(),
             method: "processing_intent".into(),
             interface_major: 1,
-            interface_minor: 1,
+            interface_minor: if cfg!(feature = "legacy-installed-abi") {
+                0
+            } else {
+                1
+            },
             request: schema(
                 &[
                     ("target", Kind::Object),
                     ("revision", Kind::String),
                     ("settings", Kind::Object),
                 ],
-                &[("output_hdr", Kind::Boolean)],
+                if cfg!(feature = "legacy-installed-abi") {
+                    &[]
+                } else {
+                    &[("output_hdr", Kind::Boolean)]
+                },
             ),
             response: schema(
                 &[("status", Kind::String)],
@@ -317,12 +323,9 @@ pub(crate) fn intent(caller: &str, allowed: &[String], payload: Value) -> Value 
     if crate::settings_descriptor::validate(&values).is_err() {
         return reject("invalid_settings");
     }
-    let Some(enabled) = settings.get("rtx_hdr_enable").and_then(Value::as_bool) else {
-        return reject("invalid_settings");
-    };
-    // Pipeline participation is distinct from effect enablement. An HDR stream
-    // keeps an SDR source and stable HDR output even when conversion starts off.
-    let prepared = enabled || args.get("output_hdr").and_then(Value::as_bool) == Some(true);
+    let prepared = conversion_enabled(settings)
+        || (settings["rtx_hdr_scope"] == "global"
+            && args.get("output_hdr").and_then(Value::as_bool) == Some(true));
     let mut processor_settings = settings.clone();
     if let Some(object) = processor_settings.as_object_mut() {
         object.insert("foreground_target".into(), target.clone());
@@ -332,6 +335,14 @@ pub(crate) fn intent(caller: &str, allowed: &[String], payload: Value) -> Value 
         "source_hdr_required":if prepared { Some(false) } else { None },
         "output_hdr_required":if prepared { Some(true) } else { None },
         "processor_settings":processor_settings, "processor_service":crate::SERVICE})
+}
+
+fn conversion_enabled(settings: &Value) -> bool {
+    match settings["rtx_hdr_scope"].as_str() {
+        Some("global") => settings["rtx_hdr_enable"] == true,
+        Some("application") => settings["rtx_hdr_application_enable"] == true,
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -371,7 +382,7 @@ mod tests {
         assert_eq!(planned["plan"]["resources"], json!([]));
         assert!(planned["plan"]["constraints"]["processing_requirement"].is_null());
         let mut enabled_request = request.clone();
-        enabled_request["arguments"]["settings"]["rtx_hdr_enable"] = json!(true);
+        enabled_request["arguments"]["settings"]["rtx_hdr_application_enable"] = json!(true);
         let enabled_plan = handle("coordinator", &selected, enabled_request);
         assert_eq!(
             enabled_plan["plan"]["constraints"]["processing_requirement"],
@@ -393,7 +404,7 @@ mod tests {
         );
     }
     #[test]
-    fn hdr_intent_reserves_processing_while_conversion_starts_disabled() {
+    fn unconfigured_application_does_not_reserve_processing() {
         let settings =
             amaterasu_configuration_schema::defaults(&crate::settings_descriptor::definitions())
                 .unwrap();
@@ -404,21 +415,11 @@ mod tests {
             }});
             let result = intent("consumer", &["consumer".into()], request);
             assert_eq!(result["status"], "succeeded");
-            assert_eq!(result["enabled"], output_hdr);
+            assert_eq!(result["enabled"], false);
             assert_eq!(result["processor_settings"]["rtx_hdr_enable"], false);
             assert_eq!(result["processor_settings"]["foreground_target"], target);
-            assert_eq!(
-                result["source_hdr_required"],
-                if output_hdr {
-                    json!(false)
-                } else {
-                    Value::Null
-                }
-            );
-            assert_eq!(
-                result["output_hdr_required"],
-                if output_hdr { json!(true) } else { Value::Null }
-            );
+            assert_eq!(result["source_hdr_required"], Value::Null);
+            assert_eq!(result["output_hdr_required"], Value::Null);
         }
     }
 
@@ -441,6 +442,11 @@ mod tests {
         assert_eq!(disabled["enabled"], false);
         assert!(disabled["source_hdr_required"].is_null());
         request["arguments"]["settings"]["rtx_hdr_enable"] = json!(true);
+        assert_eq!(
+            intent("stream.consumer", &allowed, request.clone())["enabled"],
+            false
+        );
+        request["arguments"]["settings"]["rtx_hdr_application_enable"] = json!(true);
         let enabled = intent("stream.consumer", &allowed, request.clone());
         assert_eq!(enabled["status"], "succeeded");
         assert_eq!(enabled["source_hdr_required"], false);
@@ -448,6 +454,12 @@ mod tests {
         assert_eq!(enabled["target"], target);
         assert_eq!(enabled["revision"], "snapshot");
         assert_eq!(enabled["processor_settings"]["foreground_target"], target);
+        request["arguments"]["settings"]["rtx_hdr_scope"] = json!("global");
+        request["arguments"]["settings"]["rtx_hdr_application_enable"] = json!(false);
+        assert_eq!(
+            intent("stream.consumer", &allowed, request.clone())["enabled"],
+            true
+        );
         request["arguments"]["settings"]["rtx_hdr_peak_brightness"] = json!(2001);
         assert_eq!(
             intent("stream.consumer", &allowed, request)["reason"],

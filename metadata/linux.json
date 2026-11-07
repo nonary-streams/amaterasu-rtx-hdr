@@ -18,9 +18,47 @@
           "default": false,
           "type": "boolean"
         },
-        "help": "Convert SDR video to HDR on a supported NVIDIA GPU and HDR client. Toggle conversion live within an HDR stream; disabled conversion retains SDR appearance in the same HDR output.",
+        "help": "Enable RTX HDR in global mode.",
         "id": "rtx_hdr_enable",
         "label": "Enable RTX HDR",
+        "presentation": null,
+        "required_capabilities": []
+      },
+      {
+        "allowed_scopes": [
+          "host"
+        ],
+        "apply_policy": "next_stream",
+        "choice_labels": {
+          "application": "Per application (opt in)",
+          "global": "Globally"
+        },
+        "definition": {
+          "default": "application",
+          "options": [
+            "application",
+            "global"
+          ],
+          "type": "enum"
+        },
+        "help": "RTX HDR forces an SDR source and converts it to HDR; the client must request HDR. Scope changes apply to the next stream.",
+        "id": "rtx_hdr_scope",
+        "label": "Apply RTX HDR",
+        "presentation": "radio_group",
+        "required_capabilities": []
+      },
+      {
+        "allowed_scopes": [
+          "application"
+        ],
+        "apply_policy": "next_stream",
+        "definition": {
+          "default": false,
+          "type": "boolean"
+        },
+        "help": "Opt this application in.",
+        "id": "rtx_hdr_application_enable",
+        "label": "Enable RTX HDR for this application",
         "presentation": null,
         "required_capabilities": []
       },
@@ -58,7 +96,7 @@
           "minimum": 10,
           "type": "integer"
         },
-        "help": "Adjust the brightness of midtones.",
+        "help": "Adjust midtone brightness.",
         "id": "rtx_hdr_middle_gray",
         "label": "Middle gray",
         "presentation": "slider",
@@ -78,7 +116,7 @@
           "minimum": -100,
           "type": "integer"
         },
-        "help": "Adjust the contrast of the HDR conversion.",
+        "help": "Adjust contrast.",
         "id": "rtx_hdr_contrast",
         "label": "Contrast",
         "presentation": "slider",
@@ -98,7 +136,7 @@
           "minimum": -100,
           "type": "integer"
         },
-        "help": "Adjust color saturation of the HDR conversion.",
+        "help": "Adjust color saturation.",
         "id": "rtx_hdr_saturation",
         "label": "Saturation",
         "presentation": "slider",
@@ -134,7 +172,7 @@
           "default": false,
           "type": "boolean"
         },
-        "help": "Use SDR fallback while the application is not in the foreground or its state is unavailable.",
+        "help": "Use SDR fallback when the application is not confirmed foreground.",
         "id": "rtx_hdr_foreground_only",
         "label": "Only convert the foreground application",
         "presentation": null,
@@ -154,7 +192,7 @@
           "minimum": 0,
           "type": "integer"
         },
-        "help": "Adjust SDR fallback brightness when conversion is inactive.",
+        "help": "Adjust fallback brightness.",
         "id": "rtx_hdr_sdr_brightness",
         "label": "SDR fallback brightness",
         "presentation": "slider",
@@ -180,7 +218,7 @@
       }
     ],
     "provider": "amaterasu.rtx-hdr",
-    "revision": 2,
+    "revision": 3,
     "settings_validate": {
       "interface_major": 1,
       "interface_minor": 0,
@@ -378,6 +416,227 @@
         }
       },
       "service": "nonary.rtx-hdr/1"
+    }
+  ],
+  "migrations": [
+    {
+      "from_schema_revision": 1,
+      "old_allowed": {
+        "rtx_hdr_contrast": [
+          "host",
+          "application",
+          "paired_client",
+          "session"
+        ],
+        "rtx_hdr_debanding": [
+          "host",
+          "application",
+          "paired_client",
+          "session"
+        ],
+        "rtx_hdr_enable": [
+          "host",
+          "application",
+          "paired_client"
+        ],
+        "rtx_hdr_foreground_only": [
+          "host",
+          "application",
+          "paired_client",
+          "session"
+        ],
+        "rtx_hdr_fullscreen_only": [
+          "host",
+          "application",
+          "paired_client",
+          "session"
+        ],
+        "rtx_hdr_middle_gray": [
+          "host",
+          "application",
+          "paired_client",
+          "session"
+        ],
+        "rtx_hdr_peak_brightness": [
+          "host",
+          "application",
+          "paired_client",
+          "session"
+        ],
+        "rtx_hdr_saturation": [
+          "host",
+          "application",
+          "paired_client",
+          "session"
+        ],
+        "rtx_hdr_sdr_brightness": [
+          "host",
+          "application",
+          "paired_client",
+          "session"
+        ]
+      },
+      "old_fields": {
+        "rtx_hdr_contrast": {
+          "default": 0,
+          "maximum": 100,
+          "minimum": -100,
+          "type": "integer"
+        },
+        "rtx_hdr_debanding": {
+          "default": true,
+          "type": "boolean"
+        },
+        "rtx_hdr_enable": {
+          "default": false,
+          "type": "boolean"
+        },
+        "rtx_hdr_foreground_only": {
+          "default": false,
+          "type": "boolean"
+        },
+        "rtx_hdr_fullscreen_only": {
+          "default": false,
+          "type": "boolean"
+        },
+        "rtx_hdr_middle_gray": {
+          "default": 50,
+          "maximum": 100,
+          "minimum": 10,
+          "type": "integer"
+        },
+        "rtx_hdr_peak_brightness": {
+          "default": 1000,
+          "maximum": 2000,
+          "minimum": 400,
+          "type": "integer"
+        },
+        "rtx_hdr_saturation": {
+          "default": 0,
+          "maximum": 100,
+          "minimum": -100,
+          "type": "integer"
+        },
+        "rtx_hdr_sdr_brightness": {
+          "default": 0,
+          "maximum": 100,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "removed": [],
+      "renames": {},
+      "replacements": []
+    },
+    {
+      "from_schema_revision": 2,
+      "old_allowed": {
+        "rtx_hdr_contrast": [
+          "host",
+          "application",
+          "paired_client",
+          "session"
+        ],
+        "rtx_hdr_debanding": [
+          "host",
+          "application",
+          "paired_client",
+          "session"
+        ],
+        "rtx_hdr_enable": [
+          "host",
+          "application",
+          "paired_client",
+          "session"
+        ],
+        "rtx_hdr_foreground_only": [
+          "host",
+          "application",
+          "paired_client",
+          "session"
+        ],
+        "rtx_hdr_fullscreen_only": [
+          "host",
+          "application",
+          "paired_client",
+          "session"
+        ],
+        "rtx_hdr_middle_gray": [
+          "host",
+          "application",
+          "paired_client",
+          "session"
+        ],
+        "rtx_hdr_peak_brightness": [
+          "host",
+          "application",
+          "paired_client",
+          "session"
+        ],
+        "rtx_hdr_saturation": [
+          "host",
+          "application",
+          "paired_client",
+          "session"
+        ],
+        "rtx_hdr_sdr_brightness": [
+          "host",
+          "application",
+          "paired_client",
+          "session"
+        ]
+      },
+      "old_fields": {
+        "rtx_hdr_contrast": {
+          "default": 0,
+          "maximum": 100,
+          "minimum": -100,
+          "type": "integer"
+        },
+        "rtx_hdr_debanding": {
+          "default": true,
+          "type": "boolean"
+        },
+        "rtx_hdr_enable": {
+          "default": false,
+          "type": "boolean"
+        },
+        "rtx_hdr_foreground_only": {
+          "default": false,
+          "type": "boolean"
+        },
+        "rtx_hdr_fullscreen_only": {
+          "default": false,
+          "type": "boolean"
+        },
+        "rtx_hdr_middle_gray": {
+          "default": 50,
+          "maximum": 100,
+          "minimum": 10,
+          "type": "integer"
+        },
+        "rtx_hdr_peak_brightness": {
+          "default": 1000,
+          "maximum": 2000,
+          "minimum": 400,
+          "type": "integer"
+        },
+        "rtx_hdr_saturation": {
+          "default": 0,
+          "maximum": 100,
+          "minimum": -100,
+          "type": "integer"
+        },
+        "rtx_hdr_sdr_brightness": {
+          "default": 0,
+          "maximum": 100,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "removed": [],
+      "renames": {},
+      "replacements": []
     }
   ]
 }
