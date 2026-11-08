@@ -1,0 +1,40 @@
+{
+  "processor": {
+    "principal": "amaterasu.rtx-hdr",
+    "service": "amaterasu.rtx-hdr/1",
+    "contract": "amaterasu.frame-processor.native/1",
+    "interface_major": 1,
+    "interface_minor": 0
+  },
+  "frame_consumer": {
+    "principal": "amaterasu.linux-session-video",
+    "service": "amaterasu.video/1",
+    "contract": "amaterasu.video.native/1",
+    "interface_major": 1,
+    "interface_minor": 0
+  },
+  "frame_settings": {
+    "rtx_hdr_enable": true,
+    "rtx_hdr_scope": "global",
+    "rtx_hdr_application_enable": false,
+    "rtx_hdr_peak_brightness": 1000,
+    "rtx_hdr_middle_gray": 50,
+    "rtx_hdr_contrast": 0,
+    "rtx_hdr_saturation": 0,
+    "rtx_hdr_debanding": true,
+    "rtx_hdr_sdr_brightness": 0,
+    "rtx_hdr_foreground_only": false,
+    "rtx_hdr_fullscreen_only": false
+  },
+  "stream_owner": null,
+  "lifecycle": null,
+  "settings_registry": null,
+  "display_settings": null,
+  "foreground": null,
+  "request_ancestors": [],
+  "settings_editors": [],
+  "prepared_context_consumers": [],
+  "lifecycle_admitters": [],
+  "history_owners": [],
+  "source_preflight_consumers": []
+}

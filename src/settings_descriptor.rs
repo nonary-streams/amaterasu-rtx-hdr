@@ -68,7 +68,7 @@ pub fn descriptor() -> ExtensionDescriptor {
         (
             "rtx_hdr_scope",
             "Apply RTX HDR",
-            "RTX HDR forces an SDR source and converts it to HDR; the client must request HDR. Scope changes apply to the next stream.",
+            "RTX HDR converts an SDR source to HDR output. SDR streams bypass the effect. Scope changes apply to the next stream.",
         ),
         (
             "rtx_hdr_application_enable",

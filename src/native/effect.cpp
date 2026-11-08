@@ -114,9 +114,23 @@ void Session::configure(const uint32_t *values, bool active, uint32_t brightness
     sdr_brightness = brightness;
 }
 
-// The input texture must be mapped on this session's stream.
+// Map only while copying into the model-owned image. CUDA unmap orders all
+// preceding stream work before subsequent GL work, so placing inference inside
+// this scope also serializes the next GL sample behind the entire HDR effect.
+void copy_graphics_input(Api &api, CUstream stream, CUgraphicsResource resource, Image &input) {
+    cuda_check(api.map(1, &resource, stream), "map effect input");
+    try {
+        copy_array(api, stream, mapped_array(api, resource), input, true);
+    } catch (...) {
+        if (api.unmap(1, &resource, stream) != CUDA_SUCCESS)
+            std::abort();
+        throw;
+    }
+    cuda_check(api.unmap(1, &resource, stream), "unmap effect input");
+}
+
 void Session::copy_input() {
-    copy_array(*api, stream, mapped_array(*api, input_resource), input, true);
+    copy_graphics_input(*api, stream, input_resource, input);
 }
 
 void Session::close() {

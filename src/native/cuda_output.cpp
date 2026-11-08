@@ -61,21 +61,14 @@ void Session::write_output(CudaOutput &destination) {
 }
 
 void Session::convert_to_cuda(CudaOutput &destination) {
-    // Mapping orders the GL sampling draw before this stream. Everything after
-    // it is CUDA on one stream: upload, model, output kernel, ready event.
-    cuda_check(api->map(1, &input_resource, stream), "map effect input");
-    try {
-        copy_input();
-        if (enabled)
-            vfx_check(api->run_effect(effect, 1), "run TrueHDR");
-        write_output(destination);
-        cuda_check(api->record_event(destination.ready, stream), "record output ready");
-    } catch (...) {
-        if (api->unmap(1, &input_resource, stream) != CUDA_SUCCESS)
-            std::abort();
-        throw;
-    }
-    cuda_check(api->unmap(1, &input_resource, stream), "unmap effect input");
+    // Retire the graphics read after its copy, before queuing inference. The
+    // model uses its own image; its work need not hold the next GL sample.
+    // All CUDA accesses to that model image remain ordered on this stream.
+    copy_input();
+    if (enabled)
+        vfx_check(api->run_effect(effect, 1), "run TrueHDR");
+    write_output(destination);
+    cuda_check(api->record_event(destination.ready, stream), "record output ready");
 }
 
 void Session::upload_cpu(const AmaterasuCpuFrame &frame, const AmaterasuFrameColorMetadata &color) {

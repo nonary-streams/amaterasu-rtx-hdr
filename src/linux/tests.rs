@@ -38,10 +38,30 @@ fn intent_settings() -> (serde_json::Value, serde_json::Value) {
     settings["rtx_hdr_scope"] = "global".into();
     settings["rtx_hdr_peak_brightness"] = 1000.into();
     let target = serde_json::json!({"kind":"stream","host_epoch":"epoch","session_id":"session","stream_id":"stream","generation":1});
-    let request = serde_json::json!({"method":"processing_intent","interface_major":1,"interface_minor":0,"arguments":{"target":target,"revision":"snapshot","settings":settings}});
+    let request = serde_json::json!({"method":"processing_intent","interface_major":1,"interface_minor":1,"arguments":{"target":target,"revision":"snapshot","settings":settings}});
     let response = crate::lifecycle::intent("consumer", &["consumer".into()], request);
     assert_eq!(response["status"], "succeeded");
     (response["processor_settings"].clone(), settings)
+}
+
+#[test]
+fn foreground_restrictions_are_rejected_without_an_observer() {
+    let (mut initial, mut update) = intent_settings();
+    let mut processor = Processor::new(settings());
+    initial["rtx_hdr_foreground_only"] = true.into();
+    assert_eq!(
+        processor.configure_stream(1, &serde_json::to_vec(&initial).unwrap()),
+        Err(STATUS_INVALID_ARGUMENT)
+    );
+    initial["rtx_hdr_foreground_only"] = false.into();
+    processor
+        .configure_stream(1, &serde_json::to_vec(&initial).unwrap())
+        .unwrap();
+    update["rtx_hdr_fullscreen_only"] = true.into();
+    assert_eq!(
+        processor.update_stream(1, &serde_json::to_vec(&update).unwrap()),
+        Err(STATUS_INVALID_ARGUMENT)
+    );
 }
 
 #[test]
@@ -442,7 +462,9 @@ impl Binding {
     }
     fn new(config: Settings) -> Self {
         let b = Self(into_frame_processor_binding(Processor::new(config)));
-        unsafe { configure_frame_stream(b.api(), 77, br#"{"rtx_hdr_enable":true}"#) }.unwrap();
+        let (controls, _) = intent_settings();
+        unsafe { configure_frame_stream(b.api(), 77, &serde_json::to_vec(&controls).unwrap()) }
+            .unwrap();
         b
     }
     fn negotiate(&self, source: &CaptureResourceOffer) {
@@ -687,7 +709,9 @@ fn nvidia_cached_output_is_invalidated_by_updates_without_mutating_other_readers
     assert_eq!(read(&source.session, &cached), before);
     unsafe { release(cached) };
     let api = binding.api();
-    unsafe { update_frame_stream(api, 77, br#"{"rtx_hdr_enable":false}"#) }.unwrap();
+    let (mut controls, _) = intent_settings();
+    controls["rtx_hdr_enable"] = false.into();
+    unsafe { update_frame_stream(api, 77, &serde_json::to_vec(&controls).unwrap()) }.unwrap();
     let changed = binding
         .process(&source.resource(1, CAPTURE_FRAME_CACHED_REUSE))
         .unwrap();
@@ -747,4 +771,16 @@ fn contended_foreground_policy_defers_without_switching_effects_or_waiting() {
     assert_eq!(processor.conversion_enabled(1), Err(MEDIA_BUSY));
     drop(held);
     assert_eq!(processor.conversion_enabled(1), Ok(false));
+}
+
+#[test]
+fn graphics_input_is_released_before_inference_and_on_copy_failure() {
+    unsafe extern "C" {
+        fn am_rtx_test_input_copy_scope(failure: u32) -> i32;
+    }
+    for failure in 0..=2 {
+        // SAFETY: the private fixture uses thread-local fake CUDA callbacks;
+        // it owns its test API and retains no pointers after this call.
+        assert_eq!(unsafe { am_rtx_test_input_copy_scope(failure) }, 0);
+    }
 }

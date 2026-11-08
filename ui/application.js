@@ -41,7 +41,7 @@ window.AmaterasuExtensions.v1.register('rtx-hdr', {
     status.setAttribute('role', 'status');
     const help = document.createElement('p');
     help.className = 'rtx-hdr-help';
-    help.textContent = 'Convert SDR games to HDR. Your client must request HDR. Settings use your global values until you change them, and changes save automatically.';
+    help.textContent = 'Convert SDR games to HDR when your client requests HDR. SDR streams bypass the effect. Settings use your global values until you change them, and changes save automatically.';
     const timing = document.createElement('p');
     timing.className = 'rtx-hdr-timing';
     const surface = document.createElement('div');

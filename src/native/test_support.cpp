@@ -145,3 +145,64 @@ extern "C" void am_rtx_test_source_close(void *raw, void *source) {
     try {rtx::Current current(*session.api, session.surface,session.context);output->close(session.surface);}catch(...){std::abort();}
     delete output;
 }
+
+namespace {
+struct InputCopyProbe {
+    unsigned step = 0;
+    unsigned failure = 0;
+    bool mapped = false;
+    bool valid = true;
+};
+thread_local InputCopyProbe *input_copy_probe = nullptr;
+CUresult CUDAAPI probe_map(unsigned count, CUgraphicsResource *resources, CUstream) {
+    auto &probe = *input_copy_probe;
+    probe.valid &= count == 1 && resources != nullptr && ++probe.step == 1;
+    if (probe.failure == 2) return CUDA_ERROR_INVALID_VALUE;
+    probe.mapped = true;
+    return CUDA_SUCCESS;
+}
+CUresult CUDAAPI probe_array(CUarray *array, CUgraphicsResource, unsigned index, unsigned level) {
+    auto &probe = *input_copy_probe;
+    probe.valid &= probe.mapped && ++probe.step == 2 && index == 0 && level == 0;
+    *array = reinterpret_cast<CUarray>(0x1000);
+    return CUDA_SUCCESS;
+}
+CUresult CUDAAPI probe_copy(const CUDA_MEMCPY2D *copy, CUstream) {
+    auto &probe = *input_copy_probe;
+    probe.valid &= probe.mapped && ++probe.step == 3 && copy != nullptr &&
+        copy->srcMemoryType == CU_MEMORYTYPE_ARRAY && copy->dstMemoryType == CU_MEMORYTYPE_DEVICE &&
+        copy->WidthInBytes == 8 && copy->Height == 1;
+    return probe.failure == 1 ? CUDA_ERROR_INVALID_VALUE : CUDA_SUCCESS;
+}
+CUresult CUDAAPI probe_unmap(unsigned count, CUgraphicsResource *, CUstream) {
+    auto &probe = *input_copy_probe;
+    probe.valid &= probe.mapped && count == 1 && ++probe.step == 4;
+    probe.mapped = false;
+    return CUDA_SUCCESS;
+}
+}
+
+// Exercise the actual production copy operation without a GPU. Returning to
+// the caller that queues inference must release the mapped graphics resource,
+// including on a failed copy; a failed map must not unmap an unowned resource.
+extern "C" int am_rtx_test_input_copy_scope(unsigned failure) {
+    InputCopyProbe probe;
+    probe.failure = failure;
+    input_copy_probe = &probe;
+    rtx::Api api{};
+    api.map = probe_map;
+    api.mapped_array = probe_array;
+    api.copy = probe_copy;
+    api.unmap = probe_unmap;
+    rtx::Image image{};
+    image.width = 2;
+    image.height = 1;
+    image.pitch = 8;
+    image.pixels = reinterpret_cast<void *>(0x2000);
+    bool threw = false;
+    try { rtx::copy_graphics_input(api, nullptr, nullptr, image); }
+    catch (...) { threw = true; }
+    input_copy_probe = nullptr;
+    return probe.valid && !probe.mapped && threw == (failure != 0) &&
+        probe.step == (failure == 2 ? 1u : 4u) ? 0 : -1;
+}

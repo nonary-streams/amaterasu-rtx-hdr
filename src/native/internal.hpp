@@ -159,6 +159,8 @@ struct CudaOutput {
     CUevent ready = nullptr;
 };
 
+void copy_graphics_input(Api &, CUstream, CUgraphicsResource, Image &);
+
 struct Session {
     std::shared_ptr<Api> api;
     CUdevice device = 0;

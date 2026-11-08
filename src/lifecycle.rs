@@ -10,36 +10,31 @@ use amaterasu_module_sdk::{
         ResourcePlan,
     },
 };
-use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
-#[derive(Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone)]
 pub(crate) struct Selection {
     principal: String,
     pub(crate) service: String,
 }
 
-pub(crate) fn selection(settings: &Value) -> ModuleResult<Option<Selection>> {
-    let Some(value) = settings.get("lifecycle_coordinator") else {
+pub(crate) fn selection(
+    binding: Option<&amaterasu_module_sdk::processing_composition::CapabilityBinding>,
+) -> ModuleResult<Option<Selection>> {
+    let Some(binding) = binding else {
         return Ok(None);
     };
-    let selected: Selection =
-        serde_json::from_value(value.clone()).map_err(|_| "invalid lifecycle coordinator")?;
-    let valid = |value: &str| {
-        !value.is_empty()
-            && value.len() <= 128
-            && value.bytes().all(|byte| {
-                byte.is_ascii_lowercase()
-                    || byte.is_ascii_digit()
-                    || matches!(byte, b'.' | b'_' | b'-' | b'/')
-            })
-    };
-    if !valid(&selected.principal) || !valid(&selected.service) {
-        return Err("invalid lifecycle coordinator".into());
-    }
-    Ok(Some(selected))
+    amaterasu_module_sdk::processing_composition::require_contract(
+        binding,
+        amaterasu_module_sdk::extension_api::SESSION_LIFECYCLE_SERVICE,
+        1,
+        0,
+    )?;
+    Ok(Some(Selection {
+        principal: binding.principal.clone(),
+        service: binding.service.clone(),
+    }))
 }
 
 fn schema(required: &[(&str, Kind)], optional: &[(&str, Kind)]) -> ApiSchema {
@@ -176,13 +171,10 @@ pub(crate) fn handle(caller: &str, selected: &Selection, payload: Value) -> Valu
             .unwrap_or_else(|_| rejected("invalid_join_context"));
     }
     let settings = json!(request.settings);
-    let processing_requirement = if conversion_enabled(&settings)
-        || (settings["rtx_hdr_scope"] == "global"
-            && request
-                .requested_video
-                .as_ref()
-                .is_some_and(|video| video.hdr))
-    {
+    let processing_requirement = if prepares_conversion(
+        &settings,
+        request.requested_video.as_ref().map(|video| video.hdr),
+    ) {
         json!({"source_hdr_required":false, "output_hdr_required":true})
     } else {
         json!(null)
@@ -272,10 +264,9 @@ pub(crate) fn intent(caller: &str, allowed: &[String], payload: Value) -> Value 
     let Some(envelope) = payload.as_object().filter(|object| object.len() == 4) else {
         return reject("invalid_request");
     };
-    let minor = envelope.get("interface_minor").and_then(Value::as_u64);
     if envelope.get("method") != Some(&json!("processing_intent"))
         || envelope.get("interface_major") != Some(&json!(1))
-        || !matches!(minor, Some(0 | 1))
+        || envelope.get("interface_minor") != Some(&json!(1))
     {
         return reject("invalid_request");
     }
@@ -284,9 +275,7 @@ pub(crate) fn intent(caller: &str, allowed: &[String], payload: Value) -> Value 
         .and_then(Value::as_object)
         .filter(|object| {
             object.len() == 3
-                || (minor == Some(1)
-                    && object.len() == 4
-                    && object.get("output_hdr").is_some_and(Value::is_boolean))
+                || (object.len() == 4 && object.get("output_hdr").is_some_and(Value::is_boolean))
         })
     else {
         return reject("invalid_request");
@@ -315,9 +304,7 @@ pub(crate) fn intent(caller: &str, allowed: &[String], payload: Value) -> Value 
     if crate::settings_descriptor::validate(&values).is_err() {
         return reject("invalid_settings");
     }
-    let prepared = conversion_enabled(settings)
-        || (settings["rtx_hdr_scope"] == "global"
-            && args.get("output_hdr").and_then(Value::as_bool) == Some(true));
+    let prepared = prepares_conversion(settings, args.get("output_hdr").and_then(Value::as_bool));
     let mut processor_settings = settings.clone();
     if let Some(object) = processor_settings.as_object_mut() {
         object.insert("foreground_target".into(), target.clone());
@@ -329,12 +316,19 @@ pub(crate) fn intent(caller: &str, allowed: &[String], payload: Value) -> Value 
         "processor_settings":processor_settings, "processor_service":crate::SERVICE})
 }
 
-fn conversion_enabled(settings: &Value) -> bool {
+pub(crate) fn conversion_enabled(settings: &Value) -> bool {
     match settings["rtx_hdr_scope"].as_str() {
         Some("global") => settings["rtx_hdr_enable"] == true,
         Some("application") => settings["rtx_hdr_application_enable"] == true,
         _ => false,
     }
+}
+
+/// SDR output cannot use RTX HDR; an unknown output follows the effect setting.
+pub(crate) fn prepares_conversion(settings: &Value, output_hdr: Option<bool>) -> bool {
+    output_hdr != Some(false)
+        && (conversion_enabled(settings)
+            || (settings["rtx_hdr_scope"] == "global" && output_hdr == Some(true)))
 }
 
 #[cfg(test)]
@@ -355,9 +349,15 @@ mod tests {
 
     #[test]
     fn selected_coordinator_can_plan_without_acquiring_resources() {
-        let selected = selection(
-            &json!({"lifecycle_coordinator":{"principal":"coordinator","service":"lifecycle/1"}}),
-        )
+        let selected = selection(Some(
+            &amaterasu_module_sdk::processing_composition::CapabilityBinding {
+                principal: "coordinator".into(),
+                service: "lifecycle/1".into(),
+                contract: extension_api::SESSION_LIFECYCLE_SERVICE.into(),
+                interface_major: 1,
+                interface_minor: 0,
+            },
+        ))
         .unwrap()
         .unwrap();
         let mut request = envelope("resource_plan", "resource_plan");
@@ -380,6 +380,13 @@ mod tests {
             enabled_plan["plan"]["constraints"]["processing_requirement"],
             json!({"source_hdr_required":false, "output_hdr_required":true})
         );
+        let mut sdr_request = request.clone();
+        sdr_request["arguments"]["settings"]["rtx_hdr_application_enable"] = json!(true);
+        sdr_request["arguments"]["requested_video"] =
+            json!({"width":1920,"height":1080,"refresh_millihz":60000,"hdr":false});
+        let sdr_plan = handle("coordinator", &selected, sdr_request);
+        assert_eq!(sdr_plan["status"], "planned");
+        assert!(sdr_plan["plan"]["constraints"]["processing_requirement"].is_null());
         let mut callback = envelope("lifecycle_callback", "lifecycle_callback");
         callback["arguments"]["settings"] = request["arguments"]["settings"].clone();
         callback["arguments"]["approved_plan"] = planned["plan"].clone();
@@ -416,15 +423,56 @@ mod tests {
     }
 
     #[test]
+    fn enabled_conversion_is_bypassed_for_sdr_output() {
+        let defaults =
+            amaterasu_configuration_schema::defaults(&crate::settings_descriptor::definitions())
+                .unwrap();
+        let target = json!({"kind":"stream","host_epoch":"epoch","session_id":"session","stream_id":"stream","generation":1});
+        for scope in ["global", "application"] {
+            let mut settings = json!(defaults);
+            settings["rtx_hdr_scope"] = json!(scope);
+            settings["rtx_hdr_enable"] = json!(true);
+            settings["rtx_hdr_application_enable"] = json!(true);
+            for output_hdr in [false, true] {
+                let request = json!({"method":"processing_intent","interface_major":1,"interface_minor":1,"arguments":{
+                    "target":target,"revision":"snapshot","settings":settings,"output_hdr":output_hdr
+                }});
+                let result = intent("consumer", &["consumer".into()], request);
+                assert_eq!(result["status"], "succeeded");
+                assert_eq!(result["enabled"], output_hdr);
+                assert_eq!(
+                    result["source_hdr_required"],
+                    json!(output_hdr.then_some(false))
+                );
+                assert_eq!(
+                    result["output_hdr_required"],
+                    json!(output_hdr.then_some(true))
+                );
+                assert_eq!(result["processor_settings"]["rtx_hdr_enable"], true);
+                assert_eq!(
+                    result["processor_settings"]["rtx_hdr_application_enable"],
+                    true
+                );
+            }
+        }
+    }
+
+    #[test]
     fn intent_translates_frozen_settings_only_for_selected_consumers() {
         let settings =
             amaterasu_configuration_schema::defaults(&crate::settings_descriptor::definitions())
                 .unwrap();
         let target = json!({"kind":"stream","host_epoch":"epoch","session_id":"session","stream_id":"stream","generation":1});
-        let mut request = json!({"method":"processing_intent","interface_major":1,"interface_minor":0,"arguments":{
+        let mut request = json!({"method":"processing_intent","interface_major":1,"interface_minor":1,"arguments":{
             "target":target,"revision":"snapshot","settings":settings
         }});
         let allowed = vec!["stream.consumer".into()];
+        let mut incompatible = request.clone();
+        incompatible["interface_minor"] = json!(0);
+        assert_eq!(
+            intent("stream.consumer", &allowed, incompatible)["reason"],
+            "invalid_request"
+        );
         assert_eq!(
             intent("other", &allowed, request.clone())["reason"],
             "unauthorized_caller"

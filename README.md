@@ -14,74 +14,97 @@ Vibeshine's installation. The documented NVIDIA minimum driver is 570.
 
 ## Build and composition
 
-The current source is built in the Amaterasu workspace, which supplies its SDK,
-runtime verifier, and native headers. Check out this repository as the
-`modules/rtx-hdr` submodule and build from the workspace root with
-`cargo build -p amaterasu-rtx-hdr --features linux-nvidia`. A standalone SDK
-build is not yet provided. The
-resulting shared library is `target/debug/libamaterasu_rtx_hdr.so`. Development
-headers for CUDA, EGL, OpenGL, GBM and DRM are required. CUDA headers default to
-`/opt/cuda/include`; set `AMATERASU_CUDA_INCLUDE_DIR` when needed. CUDA and VFX
-functions are resolved at runtime. A build without this feature refuses startup
-instead of registering a substitute effect.
+Create a local SDK workspace from an Amaterasu checkout, clone this repository
+into it, and build the plugin independently:
 
-Example plugin startup settings:
-
-```json
-{
-  "runtime_directory": "/opt/amaterasu/nvidia-vfx-0.2.0.0",
-  "device": 0,
-  "contrast": 100,
-  "saturation": 100,
-  "middle_gray": 50,
-  "peak_luminance": 650,
-  "debanding": true,
-  "sdr_brightness": 0,
-  "max_streams": 1,
-  "output_buffers": 3
-}
+```sh
+python3 /path/to/amaterasu/scripts/create-processing-sdk.py /absolute/path/to/sdk-workspace
+git clone https://github.com/nonary-streams/amaterasu-rtx-hdr.git /absolute/path/to/sdk-workspace/modules/rtx-hdr
+cd /absolute/path/to/sdk-workspace
+cargo build -p amaterasu-rtx-hdr --features linux-nvidia
 ```
 
-Select it in the existing video provider's trusted startup settings:
+CUDA, EGL, OpenGL, GBM and DRM development headers are required. The SDK
+workspace includes the C headers and contract crates. The NVIDIA runtime helper
+is a separate Rust workspace and is not a dependency of the generic SDK.
+Vendor libraries remain separate from the plugin package.
 
-```json
-{
-  "gpu_processor_service": "amaterasu.rtx-hdr/1",
-  "require_frame_lease": true
-}
+The host selects the provider through the frame-processing SDK. The plugin does
+not select capture, video, an encoder, frame limiter, or a virtual display. Its
+[`examples/component-linux.json`](examples/component-linux.json) describes the
+independently built provider and depends only on the host runtime. A signed
+composition must bind a compatible frame-processing consumer to
+`amaterasu.rtx-hdr/1`, grant native use, and keep the provider loaded until the
+consumer retires. Capture and encoder resource compatibility is negotiated by
+the SDK; a particular capture plugin is not required.
+
+The conversion requires supported SDR input pixels and an HDR output stream.
+Both eight-bit and ten-bit SDR input are supported when the selected capture
+provider supplies a compatible resource and color description. The frame
+processor publishes its supported output resources and metadata for the selected
+encoder to negotiate. Incompatible resource, format or synchronization choices
+fail explicitly. An SDR output stream bypasses conversion.
+
+Trusted startup composition can select the Display Settings SDK when the source
+display needs an SDR adjustment. RTX HDR acquires a scoped HDR-off and
+wide-color-gamut-off lease from the selected implementation; the source owner
+closes the scope and the provider restores the display. The output stream remains
+HDR. A composition with an already suitable SDR source may omit that capability.
+Foreground/fullscreen restrictions likewise use an explicitly selected
+foreground-context implementation and do not require one when those restrictions
+are off. No optional implementation is silently selected by the plugin.
+
+For the standard Linux host, a configuration with no optional display or
+foreground provider is initialized as follows. Replace paths with trusted local
+paths:
+
+```sh
+amaterasu-release init-linux-session ROOT --external-extension-composition \
+  --rtx-hdr-runtime ROOT/data/state/rtx-hdr/runtime
+amaterasu-release pack-linux-session-rtx-hdr ROOT ARTIFACTS PACKAGE SEQUENCE
 ```
 
-These are settings fragments, not complete signed host profiles. Package the
-shared library as an ordinary independently signed module, allow it to provide
-`amaterasu.rtx-hdr/1`, and add it to video's signed startup dependencies and
-`native_use` grants. Keep the existing capture and encoder grants/dependencies.
-Do not combine this setting with `cpu_processor_service`. Installing a module
-without those composition changes does not select it.
+The packer omits the profile's foreground, display-settings, and frame-limiter
+components when the trusted policy does not select them. It rejects omission of
+a provider still selected by policy. This prepares a complete signed set; package
+activation and the installed service's publisher and policy checks remain
+separate.
 
-Use an SDR capture source providing immutable DMA-BUF leases (capture v1.6 or
-the supported negotiated DMA-BUF resource adapter), and an encoder with v1.2
-lease submission supporting packed HDR RGB input. The stream must negotiate
-10-bit HDR HEVC or AV1. The source display remains SDR; the processed output
-and client stream are HDR. A capture that already supplies HDR is rejected,
-preventing double conversion. The current automatic display configuration must
-be composed accordingly; this plugin does not toggle desktop HDR.
+A native-only selection is provided in
+[`examples/frame-only-selection.json`](examples/frame-only-selection.json).
+It explicitly supplies stream settings and selects no lifecycle, registry,
+display, or foreground capability. It requires a compatible SDR source and HDR
+output. For a managed session, supply a complete `ProcessingSelection` with the
+chosen stream, lifecycle and registry bindings and the appropriate grants; each
+binding specifies its principal, service alias, contract identity and version.
+
+Use `prepare-rtx-hdr-bootstrap ROOT SHA256 OUTPUT --processing-selection
+SELECTION_JSON` to create a review-only candidate. For production, prepare and
+approve the corresponding `review-package-activation-policy` report before
+activation. Sign the package and a local repository using the existing approved
+publisher as described in [repository publishing](../../docs/rtx-hdr-repository-publishing.md).
+Then follow [local signed package updates](../../docs/local-package-updates.md)
+to import and activate the exact verified digest. Those instructions retain the
+existing publisher, policy, replay and service-pin checks.
+
+The separate CPU pass-through example in the SDK workspace demonstrates the
+same native-only flow. See [the frame-processing SDK guide](../../docs/gpu-processing-sdk.md)
+for its complete component, selection, review and signing example.
 
 ## Pixels and ownership
 
-Input is same-resolution, single-plane `XR24`, `AR24`, `XB24`, `AB24`, `XR30`,
-`AR30`, `XB30` or `AB30`, tagged
-SDR sRGB. EGL samples its channel ordering into GPU RGBA8 for NVIDIA. Output is
-`AB30` (R10G10B10A2), BT.2020/PQ, with source sequence, timestamp and freshness
-preserved. Each dimension is 16..8192 and a packed frame is at most 128 MiB.
-There is no resize, CPU staging, software tone-map fallback, or HDR-input bypass.
+Input can be packed SDR DMA-BUF (`XR24`, `AR24`, `XB24`, `AB24`, `XR30`,
+`AR30`, `XB30`, or `AB30`) or a supported CPU BGRA8, NV12, or P010 SDR resource.
+The provider owns any CPU upload and format conversion. Output is negotiated CUDA
+R10G10B10A2 in BT.2020/PQ, with source sequence, timestamp and freshness
+preserved. Each dimension is 16..8192. The effect does not resize or accept HDR
+input for conversion.
 
 Each stream owns persistent GPU images, a TrueHDR effect, a CUDA stream and
-1..4 output buffers. An output stays immutable until its last retained reference
-and completion fence retire. A full pool returns `MEDIA_BUSY`. The provider
-retains each input until its queued GPU reads finish. The DMA-BUF output carries
-an acquire fence, while negotiated CUDA output carries a ready event. Borrowed
-inputs without retention support complete before delivery. Acquire and completion
-sync_file fences are validated and waited with a one-second deadline. Failed completion
+1..4 output buffers. An output remains immutable until its retained references
+and completion dependencies retire. A full pool returns `MEDIA_BUSY`. The
+provider retains input resources until its queued GPU reads finish; resources
+without compatible ownership or synchronization are rejected. Failed completion
 cannot permit buffer reuse; an unprovable teardown aborts the worker rather
 than returning a false retirement barrier.
 
@@ -94,32 +117,25 @@ Factory bindings isolate consumer state. CUDA and EGL contexts are restored
 after calls. Vendor libraries remain mapped for their process-wide callbacks;
 effect allocations, surfaces, fds and streams retire with their owners.
 
-CUDA graphics map and unmap order the input draw, vendor stream and output
-draw without an additional CPU wait between them. DMA-BUF delivery exports a
-native completion fence without waiting for it; systems without native fences
-complete synchronously. With GPU processor v1.4 and encoder v1.5, the shared SDK
-negotiates CUDA device memory and a ready event instead. NVENC converts directly
-to its P010 input on an ordered CUDA stream, avoiding a second GL import and
-copy. Older or incompatible consumers keep the DMA-BUF path. Successful first frames and conversion
-enable/disable transitions emit `rtx_hdr_conversion` with the actual conversion
-state and output color space. This establishes host processing, not client HDR
-presentation.
+The frame-processing SDK negotiates the CUDA output and readiness event with
+the selected consumer. NVENC can convert that output to P010 on an ordered CUDA
+stream. Successful first frames and conversion enable/disable transitions emit
+`rtx_hdr_conversion` with the actual conversion state and output color space.
+This establishes host processing, not client HDR presentation.
 
-Processor v1.1 supplies output HDR10 metadata through the SDK. This prevents
-video from advertising the original SDR source's metadata for converted pixels.
-The mastering luminance is the fixed 2000-nit supported ceiling, while the
-configured target can change within that ceiling. Unknown measured content
-light levels remain zero. Video checks the output dynamic range before invoking
-the effect and fails an incompatible stream without skipping processing.
+The processor supplies output HDR10 metadata through the SDK, independently of
+the source metadata. The mastering luminance is the fixed 2000-nit supported
+ceiling; unknown measured content light levels remain zero. Video checks the
+output dynamic range before invoking the effect.
 
 ## Foreground policy
 
 RTX HDR defaults to per-application scope. Opt in from an application's RTX
 HDR settings, or select global scope and enable RTX HDR in the host settings.
-These choices apply to the next stream. When selected, RTX HDR forces an SDR
-capture source and converts it to HDR output; the client must request HDR.
-An SDR request is rejected while conversion is selected. Unselected streams
-do not route through the RTX processor.
+These choices apply to the next stream. For HDR output, RTX HDR uses an SDR
+capture source and converts it to HDR. An SDR output request bypasses RTX HDR
+for that stream without changing the saved settings.
+Unselected streams do not route through the RTX processor.
 
 `rtx_hdr_foreground_only` and `rtx_hdr_fullscreen_only` default to false. When
 foreground matching is enabled, the plugin applies
@@ -129,7 +145,7 @@ observations use the SDR-in-HDR fallback. When fullscreen-only is enabled,
 conversion additionally requires a fresh, explicitly fullscreen observation;
 unknown fullscreen state also falls back. Trusted startup composition must set
 `foreground_context_service` and grant this plugin access to the selected
-`amaterasu.foreground-context/1` implementation and to lifecycle
+versioned foreground-context implementation and to lifecycle
 `read_provider_context`. No observer is silently selected. Foreground identity
 is an absolute executable path; launchers, Steam URIs and Proton/Wine processes
 may not match a game's configured executable, so these cases fall back rather

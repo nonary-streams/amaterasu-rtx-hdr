@@ -42,7 +42,7 @@
           ],
           "type": "enum"
         },
-        "help": "RTX HDR forces an SDR source and converts it to HDR; the client must request HDR. Scope changes apply to the next stream.",
+        "help": "RTX HDR converts an SDR source to HDR output. SDR streams bypass the effect. Scope changes apply to the next stream.",
         "id": "rtx_hdr_scope",
         "label": "Apply RTX HDR",
         "presentation": "radio_group",

@@ -5,23 +5,19 @@ use amaterasu_module_sdk::{
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
-pub(crate) fn registry_principal(settings: &Value) -> ModuleResult<Option<String>> {
-    let Some(value) = settings.get("extension_registry_principal") else {
+pub(crate) fn registry_principal(
+    binding: Option<&amaterasu_module_sdk::processing_composition::CapabilityBinding>,
+) -> ModuleResult<Option<String>> {
+    let Some(binding) = binding else {
         return Ok(None);
     };
-    let principal = value
-        .as_str()
-        .filter(|principal| {
-            !principal.is_empty()
-                && principal.len() <= 128
-                && principal.bytes().all(|byte| {
-                    byte.is_ascii_lowercase()
-                        || byte.is_ascii_digit()
-                        || matches!(byte, b'.' | b'_' | b'-')
-                })
-        })
-        .ok_or("invalid extension registry principal")?;
-    Ok(Some(principal.into()))
+    amaterasu_module_sdk::processing_composition::require_contract(
+        binding,
+        amaterasu_module_sdk::extension_api::EXTENSION_REGISTRY_SERVICE,
+        1,
+        0,
+    )?;
+    Ok(Some(binding.principal.clone()))
 }
 
 pub(crate) fn settings_registration() -> Command {
@@ -52,6 +48,7 @@ pub(crate) fn settings_registration() -> Command {
 pub(crate) fn handle_settings(
     caller: &str,
     selected_registry: Option<&str>,
+    has_foreground: bool,
     payload: Value,
 ) -> Value {
     if selected_registry != Some(caller) {
@@ -76,6 +73,14 @@ pub(crate) fn handle_settings(
         return json!({"ok":true,"valid":false,"message":"invalid settings"});
     };
     match crate::settings_descriptor::validate(&values) {
+        Ok(())
+            if !has_foreground
+                && ["rtx_hdr_foreground_only", "rtx_hdr_fullscreen_only"]
+                    .iter()
+                    .any(|name| values.get(*name) == Some(&json!(true))) =>
+        {
+            json!({"ok":true,"valid":false,"message":"foreground provider required"})
+        }
         Ok(()) => json!({"ok":true,"valid":true}),
         Err(_) => json!({"ok":true,"valid":false,"message":"invalid settings"}),
     }
@@ -85,19 +90,43 @@ pub(crate) fn handle_settings(
 mod tests {
     use super::*;
     #[test]
+    fn restricted_settings_require_a_selected_foreground_provider() {
+        let mut values =
+            amaterasu_configuration_schema::defaults(&crate::settings_descriptor::definitions())
+                .unwrap();
+        for name in ["rtx_hdr_foreground_only", "rtx_hdr_fullscreen_only"] {
+            values.insert(name.into(), json!(true));
+            let request = json!({"method":"settings_validate","interface_major":1,
+                "interface_minor":0,"arguments":{"values":values}});
+            assert_eq!(
+                handle_settings("registry", Some("registry"), false, request.clone())["valid"],
+                false
+            );
+            assert_eq!(
+                handle_settings("registry", Some("registry"), true, request)["valid"],
+                true
+            );
+            values.insert(name.into(), json!(false));
+        }
+    }
+
+    #[test]
     fn only_selected_registry_can_validate_complete_settings() {
         let values =
             amaterasu_configuration_schema::defaults(&crate::settings_descriptor::definitions())
                 .unwrap();
         let request = json!({"method":"settings_validate","interface_major":1,"interface_minor":0,"arguments":{"values":values}});
         assert_eq!(
-            handle_settings("registry", Some("registry"), request.clone())["valid"],
+            handle_settings("registry", Some("registry"), true, request.clone())["valid"],
             true
         );
         assert_eq!(
-            handle_settings("other", Some("registry"), request.clone())["valid"],
+            handle_settings("other", Some("registry"), true, request.clone())["valid"],
             false
         );
-        assert_eq!(handle_settings("registry", None, request)["valid"], false);
+        assert_eq!(
+            handle_settings("registry", None, true, request)["valid"],
+            false
+        );
     }
 }

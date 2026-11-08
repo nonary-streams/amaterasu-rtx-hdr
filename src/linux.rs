@@ -513,6 +513,9 @@ impl FrameProcessor for Processor {
         let settings = controls
             .apply(&self.settings)
             .map_err(|_| STATUS_INVALID_ARGUMENT)?;
+        if self.policy.is_none() && (settings.foreground_only || settings.fullscreen_only) {
+            return Err(STATUS_INVALID_ARGUMENT);
+        }
         self.targets.insert(stream, controls.foreground_target);
         self.set_demand(
             stream,
@@ -536,6 +539,9 @@ impl FrameProcessor for Processor {
         let settings = controls
             .apply(&self.settings)
             .map_err(|_| STATUS_INVALID_ARGUMENT)?;
+        if self.policy.is_none() && (settings.foreground_only || settings.fullscreen_only) {
+            return Err(STATUS_INVALID_ARGUMENT);
+        }
         if target_supplied
             && self.targets.get(&stream).cloned().flatten() != controls.foreground_target
         {

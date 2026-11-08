@@ -3,6 +3,11 @@
     not(all(target_os = "linux", feature = "linux-nvidia")),
     allow(dead_code)
 )]
+mod display_adjustment;
+#[cfg_attr(
+    not(all(target_os = "linux", feature = "linux-nvidia")),
+    allow(dead_code)
+)]
 mod extension;
 #[cfg(all(target_os = "linux", feature = "linux-nvidia"))]
 mod foreground_coordinator;
@@ -46,6 +51,8 @@ pub struct RtxHdr {
     processing_consumers: Vec<String>,
     #[cfg(all(target_os = "linux", feature = "linux-nvidia"))]
     foreground: Option<foreground_coordinator::Coordinator>,
+    #[cfg(all(target_os = "linux", feature = "linux-nvidia"))]
+    display_adjustment: Option<display_adjustment::Coordinator>,
 }
 
 impl ManagedModule for RtxHdr {
@@ -53,59 +60,109 @@ impl ManagedModule for RtxHdr {
         let Response::Result { payload } = runtime.send(Command::GetSettings {})? else {
             return Err("RTX HDR settings unavailable".into());
         };
-        let registry_principal = extension::registry_principal(&payload)?;
-        let lifecycle = lifecycle::selection(&payload)?;
-        let foreground_service = match payload.get("foreground_context_service") {
-            None => None,
-            Some(value) => Some(
-                value
-                    .as_str()
-                    .filter(|name| {
-                        !name.is_empty()
-                            && name.len() <= 128
-                            && name.bytes().all(|b| {
-                                b.is_ascii_lowercase()
-                                    || b.is_ascii_digit()
-                                    || matches!(b, b'.' | b'_' | b'-' | b'/')
-                            })
-                    })
-                    .ok_or("invalid foreground context service")?
-                    .to_owned(),
-            ),
-        };
-        #[cfg(not(all(target_os = "linux", feature = "linux-nvidia")))]
-        let _ = &foreground_service;
-        let processing_consumers: Vec<String> =
-            match payload.get("processing_consumer_principals") {
-                Some(value) => serde_json::from_value(value.clone())
-                    .map_err(|_| "invalid processing consumers")?,
-                None => Vec::new(),
-            };
-        if processing_consumers.len() > 16
-            || processing_consumers.iter().any(|principal| {
-                principal.is_empty()
-                    || principal.len() > 128
-                    || !principal.bytes().all(|byte| {
-                        byte.is_ascii_lowercase()
-                            || byte.is_ascii_digit()
-                            || matches!(byte, b'.' | b'_' | b'-')
-                    })
-            })
+        use amaterasu_module_sdk::processing_composition as composition_sdk;
+        let composition = runtime
+            .processing_composition()?
+            .ok_or("RTX HDR processing composition unavailable")?;
+        let processor = composition
+            .processor
+            .as_ref()
+            .ok_or("RTX HDR processor not selected")?;
+        composition_sdk::require_contract(
+            processor,
+            amaterasu_module_sdk::media::native_contracts::FRAME_PROCESSOR,
+            1,
+            0,
+        )?;
+        if processor.service != SERVICE {
+            return Err("selected RTX HDR processor service does not match provider".into());
+        }
+        if let Some(control) = &composition.processor_control {
+            composition_sdk::require_contract(
+                control,
+                composition_sdk::PROCESSING_INTENT_CONTRACT,
+                1,
+                1,
+            )?;
+            if control.principal != processor.principal
+                || control.service != settings_descriptor::SERVICE
+            {
+                return Err("selected RTX HDR control does not match provider".into());
+            }
+        } else if composition.stream_owner.is_some()
+            || composition.lifecycle.is_some()
+            || composition.settings_registry.is_some()
+            || composition.display_settings.is_some()
         {
-            return Err("invalid processing consumers".into());
+            return Err("managed RTX HDR requires a processing control contract".into());
         }
-        #[cfg(not(all(target_os = "linux", feature = "linux-nvidia")))]
-        let _ = (&registry_principal, &lifecycle);
-        let mut settings_payload = payload;
-        if let Some(object) = settings_payload.as_object_mut() {
-            object.remove("extension_registry_principal");
-            object.remove("lifecycle_coordinator");
-            object.remove("processing_consumer_principals");
-            object.remove("foreground_context_service");
+        let lifecycle = lifecycle::selection(composition.lifecycle.as_ref())?;
+        let registry_principal =
+            extension::registry_principal(composition.settings_registry.as_ref())?;
+        let display_service = composition
+            .display_settings
+            .as_ref()
+            .map(|binding| {
+                composition_sdk::require_contract(
+                    binding,
+                    amaterasu_module_sdk::display_settings::SERVICE,
+                    1,
+                    0,
+                )
+                .map(str::to_owned)
+            })
+            .transpose()?;
+        match (&display_service, &composition.source_preparation) {
+            (Some(_), Some(binding)) => {
+                composition_sdk::require_contract(
+                    binding,
+                    composition_sdk::SOURCE_PREPARATION_CONTRACT,
+                    1,
+                    0,
+                )?;
+                if binding.principal != processor.principal
+                    || binding.service != settings_descriptor::SERVICE
+                {
+                    return Err("selected source preparation does not match provider".into());
+                }
+            }
+            (None, None) => {}
+            _ => return Err("source preparation requires display settings".into()),
         }
-        let settings: Settings = serde_json::from_value(settings_payload)
+        let foreground_service = composition
+            .foreground
+            .as_ref()
+            .map(|binding| {
+                composition_sdk::require_contract(
+                    binding,
+                    amaterasu_module_sdk::foreground_context::SERVICE,
+                    1,
+                    0,
+                )
+                .map(str::to_owned)
+            })
+            .transpose()?;
+        let mut processing_consumers: Vec<String> = composition
+            .stream_owner
+            .iter()
+            .chain(composition.lifecycle.iter())
+            .map(|binding| binding.principal.clone())
+            .collect();
+        processing_consumers.sort();
+        processing_consumers.dedup();
+        let settings: Settings = serde_json::from_value(payload)
             .map_err(|error| format!("invalid RTX HDR settings: {error}"))?;
         settings.validate()?;
+        if foreground_service.is_none() && (settings.foreground_only || settings.fullscreen_only) {
+            return Err("foreground restrictions require a selected foreground provider".into());
+        }
+        #[cfg(not(all(target_os = "linux", feature = "linux-nvidia")))]
+        let _ = (
+            &registry_principal,
+            &lifecycle,
+            &display_service,
+            &processing_consumers,
+        );
         #[cfg(all(target_os = "linux", feature = "linux-nvidia"))]
         {
             if settings.require_verified_runtime {
@@ -136,12 +193,16 @@ impl ManagedModule for RtxHdr {
             let demand = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let processor_demand = demand.clone();
             let processor_policy = policy.clone();
+            let has_foreground = foreground_service.is_some();
             let foreground = foreground_service
                 .map(|service| foreground_coordinator::Coordinator::new(policy, demand, service));
             let create: CreateProcessor = Box::new(move |_principal| {
-                Ok(linux::Processor::new(settings.clone())
-                    .with_logger(logger.clone())
-                    .with_policy(processor_policy.clone(), processor_demand.clone()))
+                let processor = linux::Processor::new(settings.clone()).with_logger(logger.clone());
+                Ok(if has_foreground {
+                    processor.with_policy(processor_policy.clone(), processor_demand.clone())
+                } else {
+                    processor
+                })
             });
             let factory =
                 amaterasu_module_sdk::frame_processing::FrameProcessorFactory::new(create);
@@ -152,6 +213,16 @@ impl ManagedModule for RtxHdr {
                 for method in lifecycle::registrations() {
                     runtime.require_success(method)?;
                 }
+            }
+            let display_adjustment = display_service.map(|service| {
+                display_adjustment::Coordinator::new(service, processing_consumers.clone())
+            });
+            if display_adjustment.is_some() {
+                runtime.require_success(Command::RegisterApi {
+                    method: amaterasu_module_sdk::display_settings::preparation::method(
+                        settings_descriptor::SERVICE,
+                    ),
+                })?;
             }
             if !processing_consumers.is_empty() {
                 runtime.require_success(lifecycle::intent_registration())?;
@@ -170,6 +241,7 @@ impl ManagedModule for RtxHdr {
                 lifecycle,
                 processing_consumers,
                 foreground,
+                display_adjustment,
             })
         }
         #[cfg(not(all(target_os = "linux", feature = "linux-nvidia")))]
@@ -177,21 +249,28 @@ impl ManagedModule for RtxHdr {
     }
 
     fn quiesce(&mut self) -> ModuleResult<bool> {
+        self.tick()?;
         #[cfg(all(target_os = "linux", feature = "linux-nvidia"))]
         {
-            linux::retirement_ready()
-                .map_err(|status| format!("RTX frame resources did not retire: {status}"))
+            let frames_retired = linux::retirement_ready()
+                .map_err(|status| format!("RTX frame resources did not retire: {status}"))?;
+            Ok(frames_retired
+                && self
+                    .display_adjustment
+                    .as_ref()
+                    .is_none_or(|coordinator| coordinator.is_idle()))
         }
         #[cfg(not(all(target_os = "linux", feature = "linux-nvidia")))]
-        {
-            Ok(true)
-        }
+        Ok(true)
     }
 
     fn tick(&mut self) -> ModuleResult<()> {
         #[cfg(all(target_os = "linux", feature = "linux-nvidia"))]
         {
             self.logs.flush(&self.runtime);
+            if let Some(coordinator) = &mut self.display_adjustment {
+                coordinator.advance(&self.runtime);
+            }
             if let Some(foreground) = &mut self.foreground {
                 foreground.advance(&self.runtime);
             }
@@ -202,13 +281,36 @@ impl ManagedModule for RtxHdr {
                     caller,
                     service,
                     payload,
+                    remaining_ms,
                     ..
                 } => {
+                    if service == settings_descriptor::SERVICE
+                        && payload["method"] == "prepare_source"
+                    {
+                        let response = match &mut self.display_adjustment {
+                            Some(coordinator) => {
+                                match coordinator.enqueue(id, &caller, payload, remaining_ms) {
+                                    Ok(None) => return Ok(()),
+                                    Ok(Some(response)) => response,
+                                    Err(code) => serde_json::json!({"ok":false,"code":code}),
+                                }
+                            }
+                            None => {
+                                serde_json::json!({"ok":false,"code":"display_settings_not_selected"})
+                            }
+                        };
+                        self.runtime.send(Command::Complete {
+                            request: id,
+                            payload: response,
+                        })?;
+                        return Ok(());
+                    }
                     let response = if service == settings_descriptor::SERVICE {
                         match payload.get("method").and_then(serde_json::Value::as_str) {
                             Some("settings_validate") => extension::handle_settings(
                                 &caller,
                                 self.registry_principal.as_deref(),
+                                self.foreground.is_some(),
                                 payload,
                             ),
                             Some("processing_intent") => {
