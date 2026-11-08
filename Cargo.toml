@@ -7,7 +7,6 @@ rust-version.workspace = true
 crate-type = ["cdylib", "rlib"]
 [features]
 linux-nvidia = []
-legacy-installed-abi = []
 [dependencies]
 amaterasu-module-sdk.workspace = true
 amaterasu-media.workspace = true

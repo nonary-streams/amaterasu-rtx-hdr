@@ -121,9 +121,7 @@ pub fn descriptor() -> ExtensionDescriptor {
             definition: fields[id].clone(),
             presentation: match fields[id] {
                 Definition::Integer { .. } => Some(OptionPresentation::Slider),
-                Definition::Enum { .. } if !cfg!(feature = "legacy-installed-abi") => {
-                    Some(OptionPresentation::RadioGroup)
-                }
+                Definition::Enum { .. } => Some(OptionPresentation::RadioGroup),
                 _ => None,
             },
             allowed_scopes: if id == "rtx_hdr_scope" {
@@ -144,7 +142,7 @@ pub fn descriptor() -> ExtensionDescriptor {
                 ApplyPolicy::LiveAction
             },
             required_capabilities: vec![],
-            choice_labels: if id == "rtx_hdr_scope" && !cfg!(feature = "legacy-installed-abi") {
+            choice_labels: if id == "rtx_hdr_scope" {
                 [
                     ("application".into(), "Per application (opt in)".into()),
                     ("global".into(), "Globally".into()),
@@ -158,7 +156,6 @@ pub fn descriptor() -> ExtensionDescriptor {
     ExtensionDescriptor {
         provider: PROVIDER.into(),
         display_name: Some("RTX HDR".into()),
-        #[cfg(not(feature = "legacy-installed-abi"))]
         default_expanded: true,
         revision: 3,
         options,
@@ -223,11 +220,8 @@ mod tests {
     #[test]
     fn descriptor_defaults_and_scoped_ranges_validate() {
         let descriptor = descriptor();
-        #[cfg(not(feature = "legacy-installed-abi"))]
         assert!(descriptor.default_expanded);
-        #[cfg(not(feature = "legacy-installed-abi"))]
         let metadata = installation_metadata();
-        #[cfg(not(feature = "legacy-installed-abi"))]
         assert_eq!(metadata["descriptor"]["default_expanded"], true);
         amaterasu_module_sdk::extension_api::validate_descriptor(&descriptor).unwrap();
         let enable = descriptor

@@ -237,22 +237,14 @@ pub(crate) fn intent_registration() -> Command {
             service: crate::settings_descriptor::SERVICE.into(),
             method: "processing_intent".into(),
             interface_major: 1,
-            interface_minor: if cfg!(feature = "legacy-installed-abi") {
-                0
-            } else {
-                1
-            },
+            interface_minor: 1,
             request: schema(
                 &[
                     ("target", Kind::Object),
                     ("revision", Kind::String),
                     ("settings", Kind::Object),
                 ],
-                if cfg!(feature = "legacy-installed-abi") {
-                    &[]
-                } else {
-                    &[("output_hdr", Kind::Boolean)]
-                },
+                &[("output_hdr", Kind::Boolean)],
             ),
             response: schema(
                 &[("status", Kind::String)],
