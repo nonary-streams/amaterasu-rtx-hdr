@@ -5,35 +5,30 @@
 
 namespace rtx {
 namespace {
-void copy_texture(Api &api, CUstream stream, CUgraphicsResource resource, Image &image,
-                  bool upload) {
-    cuda_check(api.map(1, &resource, stream), "map effect texture");
-    try {
-        CUarray array = nullptr;
-        cuda_check(api.mapped_array(&array, resource, 0, 0), "resolve effect texture");
-        CUDA_MEMCPY2D copy{};
-        copy.WidthInBytes = image.width * 4;
-        copy.Height = image.height;
-        if (upload) {
-            copy.srcMemoryType = CU_MEMORYTYPE_ARRAY;
-            copy.srcArray = array;
-            copy.dstMemoryType = CU_MEMORYTYPE_DEVICE;
-            copy.dstDevice = reinterpret_cast<CUdeviceptr>(image.pixels);
-            copy.dstPitch = image.pitch;
-        } else {
-            copy.srcMemoryType = CU_MEMORYTYPE_DEVICE;
-            copy.srcDevice = reinterpret_cast<CUdeviceptr>(image.pixels);
-            copy.srcPitch = image.pitch;
-            copy.dstMemoryType = CU_MEMORYTYPE_ARRAY;
-            copy.dstArray = array;
-        }
-        cuda_check(api.copy(&copy, stream), "copy effect texture");
-    } catch (...) {
-        if (api.unmap(1, &resource, stream) != CUDA_SUCCESS)
-            std::abort();
-        throw;
+void copy_array(Api &api, CUstream stream, CUarray array, Image &image, bool upload) {
+    CUDA_MEMCPY2D copy{};
+    copy.WidthInBytes = image.width * 4;
+    copy.Height = image.height;
+    if (upload) {
+        copy.srcMemoryType = CU_MEMORYTYPE_ARRAY;
+        copy.srcArray = array;
+        copy.dstMemoryType = CU_MEMORYTYPE_DEVICE;
+        copy.dstDevice = reinterpret_cast<CUdeviceptr>(image.pixels);
+        copy.dstPitch = image.pitch;
+    } else {
+        copy.srcMemoryType = CU_MEMORYTYPE_DEVICE;
+        copy.srcDevice = reinterpret_cast<CUdeviceptr>(image.pixels);
+        copy.srcPitch = image.pitch;
+        copy.dstMemoryType = CU_MEMORYTYPE_ARRAY;
+        copy.dstArray = array;
     }
-    cuda_check(api.unmap(1, &resource, stream), "unmap effect texture");
+    cuda_check(api.copy(&copy, stream), "copy effect texture");
+}
+
+CUarray mapped_array(Api &api, CUgraphicsResource resource) {
+    CUarray array = nullptr;
+    cuda_check(api.mapped_array(&array, resource, 0, 0), "resolve effect texture");
+    return array;
 }
 } // namespace
 
@@ -51,6 +46,7 @@ Session::Session(const std::string &root, int ordinal, uint32_t width, uint32_t 
         // VFX/NGX also performs initialization on CUDA's legacy default stream.
         // Match NvVFX_CudaStreamCreate's default-stream ordering semantics.
         cuda_check(api->create_stream(&stream, CU_STREAM_DEFAULT), "create effect stream");
+        timing.open(*api);
         vfx_check(api->allocate(&input, width, height, 6, 1, 0, 1, 1), "allocate RGBA8 input");
         vfx_check(api->allocate(&output, width, height, 13, 11, 0, 1, 1),
                   "allocate RGB10A2 output");
@@ -105,6 +101,14 @@ void Session::configure(const uint32_t *values, bool active, uint32_t brightness
     if (!std::equal(parameters.begin(), parameters.end(), values)) {
         void *candidate = create_configured_effect(values);
         auto *previous = effect;
+        // Earlier frames may still run the previous model asynchronously.
+        // Drain them before the vendor releases that effect's resources.
+        try {
+            cuda_check(api->synchronize_stream(stream), "drain previous TrueHDR");
+        } catch (...) {
+            api->destroy_effect(candidate);
+            throw;
+        }
         effect = candidate;
         std::copy_n(values, 5, parameters.begin());
         api->destroy_effect(previous);
@@ -113,14 +117,15 @@ void Session::configure(const uint32_t *values, bool active, uint32_t brightness
     sdr_brightness = brightness;
 }
 
-void Session::run(const AmaterasuDmaBufFrame &frame, Output &destination) {
+int Session::run(const AmaterasuDmaBufFrame &frame, Output &destination) {
+    timing.begin(*api);
+    surface.wait_acquire(frame.planes[0].acquire_fence_fd);
+    timing.started();
     surface.capture(frame);
-    if (enabled) {
-        copy_texture(*api, stream, input_resource, input, true);
-        vfx_check(api->run_effect(effect, 0), "run TrueHDR");
-        copy_texture(*api, stream, output_resource, output, false);
-        cuda_check(api->synchronize_stream(stream), "complete TrueHDR conversion");
-    }
+    timing.sampled();
+    if (enabled)
+        convert();
+    timing.resumed();
     glBindFramebuffer(GL_FRAMEBUFFER, destination.fbo);
     glViewport(0, 0, input.width, input.height);
     glUseProgram(enabled ? surface.output_program : surface.fallback_program);
@@ -135,9 +140,37 @@ void Session::run(const AmaterasuDmaBufFrame &frame, Output &destination) {
                     100.0f + sdr_brightness);
     }
     glDrawArrays(GL_TRIANGLES, 0, 3);
-    glFinish();
+    timing.finished();
     if (glGetError() != GL_NO_ERROR)
         throw std::runtime_error("HDR output copy failed");
+    return surface.complete();
+}
+
+void Session::convert() {
+    // One interop map covers both textures. Mapping orders the preceding GL
+    // sampling draw before this stream; unmapping orders the model's output
+    // copy before the following GL draw. Every step stays queued on the GPU:
+    // the model runs asynchronously, so this thread never waits on its
+    // completion while a game holds the GPU.
+    CUgraphicsResource resources[] = {input_resource, output_resource};
+    cuda_check(api->map(2, resources, stream), "map effect textures");
+    try {
+        timing.model_queued(*api, stream, true);
+        copy_input();
+        vfx_check(api->run_effect(effect, 1), "run TrueHDR");
+        copy_array(*api, stream, mapped_array(*api, output_resource), output, false);
+        timing.model_queued(*api, stream, false);
+    } catch (...) {
+        if (api->unmap(2, resources, stream) != CUDA_SUCCESS)
+            std::abort();
+        throw;
+    }
+    cuda_check(api->unmap(2, resources, stream), "unmap effect textures");
+}
+
+// The input texture must be mapped on this session's stream.
+void Session::copy_input() {
+    copy_array(*api, stream, mapped_array(*api, input_resource), input, true);
 }
 
 void Session::close() {
@@ -146,6 +179,9 @@ void Session::close() {
             Current current(*api, surface, context);
             if (stream)
                 cuda_check(api->synchronize_stream(stream), "retire effect stream");
+            timing.close(*api);
+            if (kernels)
+                api->unload_module(kernels);
             if (input_resource)
                 cuda_check(api->unregister_image(input_resource), "retire effect input");
             if (output_resource)

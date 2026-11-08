@@ -78,9 +78,10 @@ There is no resize, CPU staging, software tone-map fallback, or HDR-input bypass
 Each stream owns persistent GPU images, a TrueHDR effect, a CUDA stream and
 1..4 output buffers. An output stays immutable until its last retained reference
 and completion fence retire. A full pool returns `MEDIA_BUSY`. The provider
-finishes every borrowed input read and output write before delivery; no frame
-pointer or asynchronous callback escapes. Acquire and completion sync_file
-fences are validated and waited with a one-second deadline. Failed completion
+retains each input until its queued GPU reads finish. The DMA-BUF output carries
+an acquire fence, while negotiated CUDA output carries a ready event. Borrowed
+inputs without retention support complete before delivery. Acquire and completion
+sync_file fences are validated and waited with a one-second deadline. Failed completion
 cannot permit buffer reuse; an unprovable teardown aborts the worker rather
 than returning a false retirement barrier.
 
@@ -93,11 +94,16 @@ Factory bindings isolate consumer state. CUDA and EGL contexts are restored
 after calls. Vendor libraries remain mapped for their process-wide callbacks;
 effect allocations, surfaces, fds and streams retire with their owners.
 
-CUDA graphics map supplies the input GL/CUDA ordering without a redundant CPU
-wait. The vendor-stream and final output completion barriers still run before
-delivery. Successful first frames and conversion enable/disable transitions
-emit `rtx_hdr_conversion` with the actual conversion state and output color
-space. This establishes host processing, not client HDR presentation.
+CUDA graphics map and unmap order the input draw, vendor stream and output
+draw without an additional CPU wait between them. DMA-BUF delivery exports a
+native completion fence without waiting for it; systems without native fences
+complete synchronously. With GPU processor v1.4 and encoder v1.5, the shared SDK
+negotiates CUDA device memory and a ready event instead. NVENC converts directly
+to its P010 input on an ordered CUDA stream, avoiding a second GL import and
+copy. Older or incompatible consumers keep the DMA-BUF path. Successful first frames and conversion
+enable/disable transitions emit `rtx_hdr_conversion` with the actual conversion
+state and output color space. This establishes host processing, not client HDR
+presentation.
 
 Processor v1.1 supplies output HDR10 metadata through the SDK. This prevents
 video from advertising the original SDR source's metadata for converted pixels.

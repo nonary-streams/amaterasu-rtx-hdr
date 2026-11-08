@@ -45,6 +45,19 @@ struct Api {
     decltype(&cuGraphicsUnmapResources) unmap;
     decltype(&cuGraphicsSubResourceGetMappedArray) mapped_array;
     decltype(&cuMemcpy2DAsync) copy;
+    decltype(&cuEventCreate) create_event;
+    decltype(&cuEventDestroy) destroy_event;
+    decltype(&cuEventRecord) record_event;
+    decltype(&cuEventQuery) query_event;
+    decltype(&cuEventElapsedTime) elapsed_time;
+    decltype(&cuDeviceGetUuid) device_uuid;
+    decltype(&cuModuleLoadData) load_module;
+    decltype(&cuModuleUnload) unload_module;
+    decltype(&cuModuleGetFunction) module_function;
+    decltype(&cuLaunchKernel) launch;
+    decltype(&cuMemAllocPitch) allocate_pitch;
+    decltype(&cuMemFree) free_memory;
+    decltype(&cuStreamWaitEvent) wait_event;
     int (*allocate)(Image *, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned);
     void (*deallocate)(Image *);
     int (*create_effect)(const char *, void **);
@@ -75,13 +88,61 @@ struct Surface {
     PFNEGLCREATEIMAGEKHRPROC create_image = nullptr;
     PFNEGLDESTROYIMAGEKHRPROC destroy_image = nullptr;
     PFNGLEGLIMAGETARGETTEXTURE2DOESPROC bind_image = nullptr;
+    PFNEGLCREATESYNCKHRPROC create_sync = nullptr;
+    PFNEGLDESTROYSYNCKHRPROC destroy_sync = nullptr;
+    PFNEGLDUPNATIVEFENCEFDANDROIDPROC duplicate_fence = nullptr;
+    PFNEGLWAITSYNCKHRPROC wait_sync = nullptr;
+    bool priority_query = false;
     GLuint input = 0, output = 0, input_fbo = 0, output_fbo = 0;
     GLuint source = 0, program = 0, output_program = 0, fallback_program = 0, vao = 0;
     void open(CUdevice device);
     void prepare(uint32_t width, uint32_t height);
     EGLImageKHR import(const AmaterasuDmaBufFrame &frame);
     void capture(const AmaterasuDmaBufFrame &frame);
+    void wait_acquire(int fence_fd);
+    int complete();
     void close();
+};
+
+/* GPU-clock stage times summed since the last take. Mirrored in linux.rs. */
+struct TimingTotals {
+    uint64_t samples, slow_frames;
+    uint64_t queue_us, queue_max_us;   /* submit until the GPU starts sampling */
+    uint64_t sample_us, sample_max_us; /* input sampling draw */
+    uint64_t model_us, model_max_us;   /* sampled until GL resumes after CUDA */
+    uint64_t model_run_us, model_run_max_us; /* CUDA execution of the model */
+    uint64_t output_us, output_max_us; /* PQ output draw */
+    uint64_t total_us, total_max_us;   /* submit until the output is written */
+};
+static_assert(sizeof(TimingTotals) == 14 * sizeof(uint64_t));
+
+/* Timestamps for a few frames in flight. Results are read only once ready,
+ * so measuring never makes the processing thread wait for the GPU. */
+class Timing {
+  public:
+    void open(Api &api);
+    void close(Api &api);
+    bool begin(Api &api);
+    void started();
+    void sampled();
+    void model_queued(Api &api, CUstream stream, bool before);
+    void resumed();
+    void finished();
+    TimingTotals take(Api &api);
+
+  private:
+    struct Frame {
+        GLuint queries[4]{};
+        CUevent events[2]{};
+        GLint64 submitted = 0;
+        bool pending = false, modeled = false;
+    };
+    void reap(Api &api);
+    std::array<Frame, 4> frames{};
+    Frame *current = nullptr;
+    size_t next = 0;
+    bool available = false;
+    TimingTotals totals{};
 };
 
 struct Current {
@@ -105,6 +166,14 @@ struct Output {
     void close(Surface &surface);
 };
 
+/* One CUDA output slot: pitch-linear X2B10G10R10 memory in the primary
+ * context and the event recorded after each write into it. */
+struct CudaOutput {
+    CUdeviceptr pixels = 0;
+    size_t pitch = 0;
+    CUevent ready = nullptr;
+};
+
 struct Session {
     std::shared_ptr<Api> api;
     CUdevice device = 0;
@@ -115,13 +184,22 @@ struct Session {
     void *effect = nullptr;
     CUgraphicsResource input_resource = nullptr, output_resource = nullptr;
     bool retained_context = false;
+    Timing timing;
+    CUmodule kernels = nullptr;
+    CUfunction pq_output = nullptr, sdr_output = nullptr;
     bool enabled = true;
     uint32_t sdr_brightness = 0;
     std::array<uint32_t, 5> parameters{};
     Session(const std::string &root, int ordinal, uint32_t width, uint32_t height,
             const uint32_t *parameters);
     ~Session();
-    void run(const AmaterasuDmaBufFrame &frame, Output &destination);
+    int run(const AmaterasuDmaBufFrame &frame, Output &destination);
+    void convert();
+    void copy_input();
+    void load_kernels();
+    void write_output(CudaOutput &destination);
+    void convert_to_cuda(CudaOutput &destination);
+    int run_cuda(const AmaterasuDmaBufFrame &frame, CudaOutput &destination);
     void configure(const uint32_t *values, bool active, uint32_t brightness);
     void *create_configured_effect(const uint32_t *values);
     void close();
@@ -133,7 +211,13 @@ void *am_rtx_open(const char *, int, uint32_t, uint32_t, const uint32_t *, char 
 void am_rtx_close(void *);
 void *am_rtx_output_open(void *, AmaterasuDmaBufFrame *, char *, size_t);
 void am_rtx_output_close(void *, void *);
-int am_rtx_process(void *, const AmaterasuDmaBufFrame *, void *, char *, size_t);
+int am_rtx_process(void *, const AmaterasuDmaBufFrame *, void *, int *, char *, size_t);
 int am_rtx_configure(void *, const uint32_t *, bool, uint32_t, char *, size_t);
 int am_rtx_wait_fence(int);
+int am_rtx_context_priority(void *);
+void am_rtx_take_timing(void *, rtx::TimingTotals *);
+int am_rtx_device_uuid(const char *, int, uint8_t *, char *, size_t);
+void *am_rtx_cuda_output_open(void *, uint64_t *, uint32_t *, void **, char *, size_t);
+void am_rtx_cuda_output_close(void *, void *);
+int am_rtx_process_cuda(void *, const AmaterasuDmaBufFrame *, void *, int *, char *, size_t);
 }

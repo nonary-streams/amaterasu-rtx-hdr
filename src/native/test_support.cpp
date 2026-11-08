@@ -39,6 +39,32 @@ extern "C" void *am_rtx_test_source_format(void *raw, AmaterasuDmaBufFrame *fram
 extern "C" void *am_rtx_test_source(void *raw, AmaterasuDmaBufFrame *frame) {
     return am_rtx_test_source_format(raw, frame, GBM_FORMAT_ABGR8888);
 }
+extern "C" int am_rtx_test_fill_source(void *raw, void *source, float red, float green,
+                                       float blue) {
+    auto &session = *static_cast<rtx::Session *>(raw);
+    auto &output = *static_cast<rtx::Output *>(source);
+    try {
+        rtx::Current current(*session.api, session.surface, session.context);
+        glBindFramebuffer(GL_FRAMEBUFFER, output.fbo);
+        glClearColor(red, green, blue, 1);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glFinish();
+        return glGetError() == GL_NO_ERROR ? 0 : -1;
+    } catch (...) {
+        return -1;
+    }
+}
+extern "C" int am_rtx_test_native_fence_available(void *raw) {
+    auto &surface = static_cast<rtx::Session *>(raw)->surface;
+    return surface.create_sync && surface.destroy_sync && surface.duplicate_fence;
+}
+extern "C" void am_rtx_test_disable_native_fence(void *raw) {
+    auto &surface = static_cast<rtx::Session *>(raw)->surface;
+    surface.create_sync = nullptr;
+    surface.destroy_sync = nullptr;
+    surface.duplicate_fence = nullptr;
+    surface.wait_sync = nullptr;
+}
 extern "C" int am_rtx_test_read(void *raw, void *surface, uint32_t *pixels, size_t length) {
     auto &session = *static_cast<rtx::Session *>(raw);
     auto &output = *static_cast<rtx::Output *>(surface);
@@ -72,6 +98,31 @@ extern "C" int am_rtx_test_read_vendor(void *raw, uint32_t *pixels, size_t lengt
         rtx::cuda_check(session.api->copy(&copy, session.stream), "read vendor test output");
         rtx::cuda_check(session.api->synchronize_stream(session.stream),
                         "complete vendor test read");
+        return 0;
+    } catch (...) {
+        return -1;
+    }
+}
+extern "C" int am_rtx_test_read_cuda(void *raw, uint64_t pointer, uint32_t pitch,
+                                     uint32_t *pixels, size_t length) {
+    auto &session = *static_cast<rtx::Session *>(raw);
+    if (length != static_cast<size_t>(session.input.width) * session.input.height)
+        return -1;
+    try {
+        rtx::Current current(*session.api, session.surface, session.context);
+        // Slot writes are queued on the session stream; read after they finish.
+        rtx::cuda_check(session.api->synchronize_stream(session.stream), "finish CUDA output");
+        CUDA_MEMCPY2D copy{};
+        copy.srcMemoryType = CU_MEMORYTYPE_DEVICE;
+        copy.srcDevice = static_cast<CUdeviceptr>(pointer);
+        copy.srcPitch = pitch;
+        copy.dstMemoryType = CU_MEMORYTYPE_HOST;
+        copy.dstHost = pixels;
+        copy.dstPitch = session.input.width * 4;
+        copy.WidthInBytes = copy.dstPitch;
+        copy.Height = session.input.height;
+        rtx::cuda_check(session.api->copy(&copy, session.stream), "read CUDA output");
+        rtx::cuda_check(session.api->synchronize_stream(session.stream), "complete CUDA read");
         return 0;
     } catch (...) {
         return -1;
