@@ -179,6 +179,19 @@ fn unsupported_input_is_rejected_before_loading_vendor_code() {
         api.base.release.unwrap()(api.base.context);
     }
 }
+
+#[test]
+fn packed_rgb_sdr_accepts_both_scanout_depths_without_accepting_hdr() {
+    for format in [
+        *b"XR24", *b"AR24", *b"XB24", *b"AB24", *b"XR30", *b"AR30", *b"XB30", *b"AB30",
+    ] {
+        let mut input = frame();
+        input.fourcc = u32::from_le_bytes(format);
+        assert!(supported_input(&input));
+        input.color = DMABUF_COLOR_BT2020_PQ;
+        assert!(!supported_input(&input));
+    }
+}
 #[test]
 fn stream_controls_update_atomically_and_retire_with_stream() {
     let mut processor = Processor::new(settings());
@@ -265,6 +278,11 @@ unsafe extern "C" fn input_release(_: *mut c_void, _: i32) {}
 
 unsafe extern "C" {
     fn am_rtx_test_source(context: *mut c_void, frame: *mut DmaBufFrame) -> *mut c_void;
+    fn am_rtx_test_source_format(
+        context: *mut c_void,
+        frame: *mut DmaBufFrame,
+        format: u32,
+    ) -> *mut c_void;
     fn am_rtx_test_read(
         context: *mut c_void,
         output: *mut c_void,
@@ -281,8 +299,16 @@ struct Source {
 }
 impl Source {
     fn new(session: Rc<NativeSession>) -> Self {
+        Self::new_format(session, None)
+    }
+    fn new_format(session: Rc<NativeSession>, format: Option<u32>) -> Self {
         let mut frame = frame();
-        let raw = unsafe { am_rtx_test_source(session.0.as_ptr(), &mut frame) };
+        let raw = unsafe {
+            match format {
+                Some(format) => am_rtx_test_source_format(session.0.as_ptr(), &mut frame, format),
+                None => am_rtx_test_source(session.0.as_ptr(), &mut frame),
+            }
+        };
         assert!(!raw.is_null(), "GPU test source allocation failed");
         frame.timestamp_us = 66;
         frame.sequence = 1;
@@ -339,16 +365,36 @@ fn nits(code: u32) -> f64 {
 #[test]
 #[ignore = "requires an NVIDIA RTX GPU and AMATERASU_TRUEHDR_RUNTIME pointing to the licensed VFX runtime"]
 fn nvidia_sdk_toggle_from_disabled_preserves_frames_and_hdr_output() {
+    for scope in ["global", "application"] {
+        verify_gpu_toggle(scope, None);
+    }
+}
+
+#[test]
+#[ignore = "requires an NVIDIA RTX GPU and AMATERASU_TRUEHDR_RUNTIME pointing to the licensed VFX runtime"]
+fn nvidia_ten_bit_sdr_application_converts_and_preserves_held_frames() {
+    for format in [*b"AR30", *b"AB30"] {
+        verify_gpu_toggle("application", Some(u32::from_le_bytes(format)));
+    }
+}
+
+fn verify_gpu_toggle(scope: &str, format: Option<u32>) {
     let mut config = settings();
     config.runtime_directory = std::env::var_os("AMATERASU_TRUEHDR_RUNTIME")
         .expect("runtime path")
         .into();
     config.output_buffers = 2;
     let stream = Stream::open(&config, 512, 288, None).unwrap();
-    let source = Source::new(stream.slots[0].session.clone());
+    let source = Source::new_format(stream.slots[0].session.clone(), format);
     let mut processor = Processor::new(config);
     let (mut controls, _) = intent_settings();
     controls["rtx_hdr_enable"] = false.into();
+    controls["rtx_hdr_scope"] = scope.into();
+    let enable_key = if scope == "application" {
+        "rtx_hdr_application_enable"
+    } else {
+        "rtx_hdr_enable"
+    };
     processor
         .configure_stream(77, &serde_json::to_vec(&controls).unwrap())
         .unwrap();
@@ -374,8 +420,9 @@ fn nvidia_sdk_toggle_from_disabled_preserves_frames_and_hdr_output() {
     );
     let held = held.unwrap();
     assert!((nits(fallback[300] & 1023) - 100.0).abs() < 3.0);
+    let mut converted = None;
     for enabled in [true, false, true, false] {
-        controls["rtx_hdr_enable"] = enabled.into();
+        controls[enable_key] = enabled.into();
         assert_eq!(
             unsafe { update_gpu_stream(api, 77, &serde_json::to_vec(&controls).unwrap()) },
             Ok(())
@@ -396,6 +443,11 @@ fn nvidia_sdk_toggle_from_disabled_preserves_frames_and_hdr_output() {
         let white = nits(pixels[300] & 1023);
         if enabled {
             assert!(white > 900.0, "conversion white: {white}");
+            if let Some(expected) = &converted {
+                assert_eq!(&pixels, expected, "conversion changed on repeated enable");
+            } else {
+                converted = Some(pixels);
+            }
         } else {
             assert_eq!(pixels, fallback);
         }

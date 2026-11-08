@@ -81,6 +81,7 @@ struct Stream {
     width: u32,
     height: u32,
     enabled: bool,
+    reported_enabled: Option<bool>,
 }
 struct Lease {
     slot: Rc<Slot>,
@@ -187,6 +188,7 @@ impl Stream {
             width,
             height,
             enabled: true,
+            reported_enabled: None,
         })
     }
 
@@ -413,6 +415,21 @@ impl GpuFrameProcessor for Processor {
         }
         let frame = input.frame();
         if !supported_input(frame) {
+            if let Some(logger) = &self.logger {
+                let message = serde_json::json!({
+                    "event": "rtx_hdr_input_rejected",
+                    "stream": stream,
+                    "width": frame.width,
+                    "height": frame.height,
+                    "color": frame.color,
+                    "fourcc": frame.fourcc,
+                    "planes": frame.plane_count,
+                    "pitch": frame.planes[0].pitch,
+                    "offset": frame.planes[0].offset,
+                })
+                .to_string();
+                let _ = logger.emit(amaterasu_module_sdk::LogLevel::Error, "rtx-hdr", &message);
+            }
             return Err(MEDIA_UNSUPPORTED);
         }
         if !self.streams.contains_key(&stream) {
@@ -457,7 +474,25 @@ impl GpuFrameProcessor for Processor {
             active.configure(settings, enabled, self.logger.as_ref())?;
             active.enabled = enabled;
         }
-        active.process(frame, self.logger.as_ref())
+        let output = active.process(frame, self.logger.as_ref())?;
+        if active.reported_enabled != Some(enabled) {
+            if let Some(logger) = &self.logger {
+                let message = serde_json::json!({
+                    "event": "rtx_hdr_conversion",
+                    "stream": stream,
+                    "enabled": enabled,
+                    "width": frame.width,
+                    "height": frame.height,
+                    "peak_nits": settings.peak_luminance,
+                    "source": "srgb",
+                    "output": "bt2020_pq",
+                })
+                .to_string();
+                let _ = logger.emit(amaterasu_module_sdk::LogLevel::Info, "rtx-hdr", &message);
+            }
+            active.reported_enabled = Some(enabled);
+        }
+        Ok(output)
     }
     fn cancel(&mut self, stream: u64) {
         self.set_demand(stream, false);
@@ -489,12 +524,14 @@ impl GpuFrameProcessor for Processor {
     }
 }
 
+/// SDR scanout may use either eight-bit or ten-bit packed RGB. EGL samples
+/// both into the same RGBA8 model input; bit depth does not imply HDR transfer.
 fn supported_input(frame: &DmaBufFrame) -> bool {
     frame.color == DMABUF_COLOR_SRGB
         && frame.plane_count == 1
         && matches!(
             frame.fourcc.to_le_bytes(),
-            [b'X' | b'A', b'R' | b'B', b'2', b'4']
+            [b'X' | b'A', b'R' | b'B', b'2', b'4'] | [b'X' | b'A', b'R' | b'B', b'3', b'0']
         )
         && (16..=8192).contains(&frame.width)
         && (16..=8192).contains(&frame.height)

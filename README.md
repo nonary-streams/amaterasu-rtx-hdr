@@ -68,7 +68,8 @@ be composed accordingly; this plugin does not toggle desktop HDR.
 
 ## Pixels and ownership
 
-Input is same-resolution, single-plane `XR24`, `AR24`, `XB24` or `AB24`, tagged
+Input is same-resolution, single-plane `XR24`, `AR24`, `XB24`, `AB24`, `XR30`,
+`AR30`, `XB30` or `AB30`, tagged
 SDR sRGB. EGL samples its channel ordering into GPU RGBA8 for NVIDIA. Output is
 `AB30` (R10G10B10A2), BT.2020/PQ, with source sequence, timestamp and freshness
 preserved. Each dimension is 16..8192 and a packed frame is at most 128 MiB.
@@ -91,6 +92,12 @@ references to have retired; video already cancels encoders before processors.
 Factory bindings isolate consumer state. CUDA and EGL contexts are restored
 after calls. Vendor libraries remain mapped for their process-wide callbacks;
 effect allocations, surfaces, fds and streams retire with their owners.
+
+CUDA graphics map supplies the input GL/CUDA ordering without a redundant CPU
+wait. The vendor-stream and final output completion barriers still run before
+delivery. Successful first frames and conversion enable/disable transitions
+emit `rtx_hdr_conversion` with the actual conversion state and output color
+space. This establishes host processing, not client HDR presentation.
 
 Processor v1.1 supplies output HDR10 metadata through the SDK. This prevents
 video from advertising the original SDR source's metadata for converted pixels.

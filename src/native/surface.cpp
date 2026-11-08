@@ -294,7 +294,9 @@ void Surface::capture(const AmaterasuDmaBufFrame &frame) {
         glUseProgram(program);
         glBindVertexArray(vao);
         glDrawArrays(GL_TRIANGLES, 0, 3);
-        glFinish();
+        // The input texture is consumed either by CUDA graphics-map or by the
+        // fallback GL draw in this same context. Both preserve this dependency.
+        // The final output glFinish still completes every borrowed input read.
         gl_check("effect source sampling failed");
     } catch (...) {
         glFinish();
