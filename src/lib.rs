@@ -37,7 +37,7 @@ pub struct RtxHdr {
     #[cfg(all(target_os = "linux", feature = "linux-nvidia"))]
     logs: amaterasu_module_sdk::LogQueue,
     #[cfg(all(target_os = "linux", feature = "linux-nvidia"))]
-    _factory: Box<amaterasu_module_sdk::processing::GpuProcessorFactory<CreateProcessor>>,
+    _factory: Box<amaterasu_module_sdk::frame_processing::FrameProcessorFactory<CreateProcessor>>,
     #[cfg(all(target_os = "linux", feature = "linux-nvidia"))]
     registry_principal: Option<String>,
     #[cfg(all(target_os = "linux", feature = "linux-nvidia"))]
@@ -143,7 +143,8 @@ impl ManagedModule for RtxHdr {
                     .with_logger(logger.clone())
                     .with_policy(processor_policy.clone(), processor_demand.clone()))
             });
-            let factory = amaterasu_module_sdk::processing::GpuProcessorFactory::new(create);
+            let factory =
+                amaterasu_module_sdk::frame_processing::FrameProcessorFactory::new(create);
             if registry_principal.is_some() {
                 runtime.require_success(extension::settings_registration())?;
             }
@@ -173,6 +174,18 @@ impl ManagedModule for RtxHdr {
         }
         #[cfg(not(all(target_os = "linux", feature = "linux-nvidia")))]
         Err("RTX HDR requires a build with the linux-nvidia backend".into())
+    }
+
+    fn quiesce(&mut self) -> ModuleResult<bool> {
+        #[cfg(all(target_os = "linux", feature = "linux-nvidia"))]
+        {
+            linux::retirement_ready()
+                .map_err(|status| format!("RTX frame resources did not retire: {status}"))
+        }
+        #[cfg(not(all(target_os = "linux", feature = "linux-nvidia")))]
+        {
+            Ok(true)
+        }
     }
 
     fn tick(&mut self) -> ModuleResult<()> {

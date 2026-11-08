@@ -55,9 +55,6 @@ Session::Session(const std::string &root, int ordinal, uint32_t width, uint32_t 
         cuda_check(api->register_image(&input_resource, surface.input, GL_TEXTURE_2D,
                                        CU_GRAPHICS_REGISTER_FLAGS_READ_ONLY),
                    "register effect input");
-        cuda_check(api->register_image(&output_resource, surface.output, GL_TEXTURE_2D,
-                                       CU_GRAPHICS_REGISTER_FLAGS_WRITE_DISCARD),
-                   "register effect output");
     } catch (...) {
         close();
         throw;
@@ -117,57 +114,6 @@ void Session::configure(const uint32_t *values, bool active, uint32_t brightness
     sdr_brightness = brightness;
 }
 
-int Session::run(const AmaterasuDmaBufFrame &frame, Output &destination) {
-    timing.begin(*api);
-    surface.wait_acquire(frame.planes[0].acquire_fence_fd);
-    timing.started();
-    surface.capture(frame);
-    timing.sampled();
-    if (enabled)
-        convert();
-    timing.resumed();
-    glBindFramebuffer(GL_FRAMEBUFFER, destination.fbo);
-    glViewport(0, 0, input.width, input.height);
-    glUseProgram(enabled ? surface.output_program : surface.fallback_program);
-    glBindVertexArray(surface.vao);
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, enabled ? surface.output : surface.input);
-    if (enabled) {
-        glUniform1f(glGetUniformLocation(surface.output_program, "peak"), parameters[3]);
-        glUniform1f(glGetUniformLocation(surface.output_program, "gray"), parameters[2]);
-    } else {
-        glUniform1f(glGetUniformLocation(surface.fallback_program, "white_nits"),
-                    100.0f + sdr_brightness);
-    }
-    glDrawArrays(GL_TRIANGLES, 0, 3);
-    timing.finished();
-    if (glGetError() != GL_NO_ERROR)
-        throw std::runtime_error("HDR output copy failed");
-    return surface.complete();
-}
-
-void Session::convert() {
-    // One interop map covers both textures. Mapping orders the preceding GL
-    // sampling draw before this stream; unmapping orders the model's output
-    // copy before the following GL draw. Every step stays queued on the GPU:
-    // the model runs asynchronously, so this thread never waits on its
-    // completion while a game holds the GPU.
-    CUgraphicsResource resources[] = {input_resource, output_resource};
-    cuda_check(api->map(2, resources, stream), "map effect textures");
-    try {
-        timing.model_queued(*api, stream, true);
-        copy_input();
-        vfx_check(api->run_effect(effect, 1), "run TrueHDR");
-        copy_array(*api, stream, mapped_array(*api, output_resource), output, false);
-        timing.model_queued(*api, stream, false);
-    } catch (...) {
-        if (api->unmap(2, resources, stream) != CUDA_SUCCESS)
-            std::abort();
-        throw;
-    }
-    cuda_check(api->unmap(2, resources, stream), "unmap effect textures");
-}
-
 // The input texture must be mapped on this session's stream.
 void Session::copy_input() {
     copy_array(*api, stream, mapped_array(*api, input_resource), input, true);
@@ -180,12 +126,12 @@ void Session::close() {
             if (stream)
                 cuda_check(api->synchronize_stream(stream), "retire effect stream");
             timing.close(*api);
+            if (upload)
+                api->free_memory(upload);
             if (kernels)
                 api->unload_module(kernels);
             if (input_resource)
                 cuda_check(api->unregister_image(input_resource), "retire effect input");
-            if (output_resource)
-                cuda_check(api->unregister_image(output_resource), "retire effect output");
             if (effect)
                 api->destroy_effect(effect);
             if (input.pixels)

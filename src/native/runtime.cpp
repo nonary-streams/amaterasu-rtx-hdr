@@ -1,14 +1,9 @@
 #include "internal.hpp"
 #include <algorithm>
-#include <cerrno>
-#include <chrono>
 #include <cstring>
 #include <dlfcn.h>
 #include <filesystem>
-#include <linux/sync_file.h>
 #include <mutex>
-#include <poll.h>
-#include <sys/ioctl.h>
 #include <vector>
 
 namespace rtx {
@@ -124,30 +119,6 @@ std::shared_ptr<Api> Api::load(const std::string &root) {
     return api;
 }
 
-void wait_fence(int fd) {
-    if (fd < 0)
-        return;
-    sync_file_info info{};
-    if (ioctl(fd, SYNC_IOC_FILE_INFO, &info) < 0)
-        throw std::runtime_error("invalid sync_file fence");
-    pollfd poller{fd, POLLIN, 0};
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1000);
-    int result = 0;
-    do {
-        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                   deadline - std::chrono::steady_clock::now())
-                                   .count();
-        if (remaining <= 0)
-            break;
-        result = poll(&poller, 1, static_cast<int>(remaining));
-    } while (result < 0 && errno == EINTR);
-    if (result != 1 || (poller.revents & (POLLERR | POLLNVAL)) || !(poller.revents & POLLIN))
-        throw std::runtime_error("GPU fence did not complete");
-    info = {};
-    if (ioctl(fd, SYNC_IOC_FILE_INFO, &info) < 0 || info.status != 1)
-        throw std::runtime_error("GPU fence failed");
-}
-
 Current::Current(Api &api_, Surface &surface_, CUcontext context) : api(api_), surface(surface_) {
     previous_display = eglGetCurrentDisplay();
     previous_context = eglGetCurrentContext();
@@ -192,57 +163,14 @@ extern "C" void *am_rtx_open(const char *root, int device, uint32_t width, uint3
     }
 }
 extern "C" void am_rtx_close(void *context) { delete static_cast<rtx::Session *>(context); }
-extern "C" void *am_rtx_output_open(void *context, AmaterasuDmaBufFrame *frame, char *error,
-                                    size_t capacity) {
-    auto &session = *static_cast<rtx::Session *>(context);
-    try {
-        auto output = std::make_unique<rtx::Output>();
-        rtx::Current current(*session.api, session.surface, session.context);
-        try {
-            output->open(session.surface, session.input.width, session.input.height);
-        } catch (...) {
-            output->close(session.surface);
-            throw;
-        }
-        *frame = output->frame;
-        return output.release();
-    } catch (const std::exception &failure) {
-        report(error, capacity, failure);
-        return nullptr;
-    }
-}
-extern "C" void am_rtx_output_close(void *context, void *raw) {
+extern "C" int am_rtx_finish(void *context) {
     auto &session = *static_cast<rtx::Session *>(context);
     try {
         rtx::Current current(*session.api, session.surface, session.context);
-        auto *output = static_cast<rtx::Output *>(raw);
-        output->close(session.surface);
-        delete output;
-    } catch (...) {
-        std::abort();
-    }
-}
-extern "C" int am_rtx_process(void *context, const AmaterasuDmaBufFrame *frame, void *output,
-                              int *completion_fence, char *error, size_t capacity) {
-    auto &session = *static_cast<rtx::Session *>(context);
-    *completion_fence = -1;
-    try {
-        rtx::Current current(*session.api, session.surface, session.context);
-        try {
-            *completion_fence = session.run(*frame, *static_cast<rtx::Output *>(output));
-        } catch (...) {
-            // No input borrow may escape on failure. Returning after an unknown
-            // GPU completion would violate the provider's ownership contract.
-            if (session.api->synchronize_context() != CUDA_SUCCESS)
-                std::abort();
-            glFinish();
-            throw;
-        }
-        return 0;
-    } catch (const std::exception &failure) {
-        report(error, capacity, failure);
-        return -1;
-    }
+        rtx::cuda_check(session.api->synchronize_stream(session.stream), "retire input reads");
+        glFinish();
+        return glGetError() == GL_NO_ERROR ? 0 : -1;
+    } catch (...) { return -1; }
 }
 extern "C" int am_rtx_configure(void *context, const uint32_t *parameters, bool enabled,
                                  uint32_t brightness, char *error, size_t capacity) {
@@ -274,12 +202,4 @@ extern "C" int am_rtx_context_priority(void *context) {
                          &priority))
         return 0;
     return priority;
-}
-extern "C" int am_rtx_wait_fence(int fd) {
-    try {
-        rtx::wait_fence(fd);
-        return 0;
-    } catch (...) {
-        return -1;
-    }
 }

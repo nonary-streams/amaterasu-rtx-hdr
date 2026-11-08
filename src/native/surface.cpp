@@ -40,14 +40,12 @@ void framebuffer(GLuint texture, GLuint &fbo) {
     if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
         throw std::runtime_error("effect framebuffer is incomplete");
 }
-void texture(GLuint &name, GLenum format, uint32_t width, uint32_t height) {
+void texture(GLuint &name, uint32_t width, uint32_t height) {
     glGenTextures(1, &name);
     glBindTexture(GL_TEXTURE_2D, name);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-    glTexImage2D(GL_TEXTURE_2D, 0, format, width, height, 0,
-                 format == GL_R32UI ? GL_RED_INTEGER : GL_RGBA,
-                 format == GL_R32UI ? GL_UNSIGNED_INT : GL_UNSIGNED_BYTE, nullptr);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
     gl_check("effect texture allocation failed");
 }
 } // namespace
@@ -112,6 +110,8 @@ void Surface::open(CUdevice cuda_device) {
             wait_sync =
                 reinterpret_cast<PFNEGLWAITSYNCKHRPROC>(eglGetProcAddress("eglWaitSyncKHR"));
     }
+    if (!create_sync || !destroy_sync || !duplicate_fence || !wait_sync)
+        throw std::runtime_error("RTX HDR requires native GPU fence import/export");
     const EGLenum previous_api = eglQueryAPI();
     if (!eglBindAPI(EGL_OPENGL_API))
         throw std::runtime_error("desktop OpenGL unavailable");
@@ -145,13 +145,8 @@ void Surface::open(CUdevice cuda_device) {
 }
 
 void Surface::prepare(uint32_t width, uint32_t height) {
-    texture(input, GL_RGBA8, width, height);
+    texture(input, width, height);
     framebuffer(input, input_fbo);
-    // CUDA/GL interop does not accept packed GL_RGB10_A2. Share the vendor's
-    // packed words through R32UI, then unpack them in a GPU shader to the
-    // exported RGB10A2 surface, preserving all ten bits without host staging.
-    texture(output, GL_R32UI, width, height);
-    framebuffer(output, output_fbo);
     glGenTextures(1, &source);
     glGenVertexArrays(1, &vao);
     const char *vertex = "#version 330\n"
@@ -160,58 +155,6 @@ void Surface::prepare(uint32_t width, uint32_t height) {
     const char *fragment = "#version 330\n"
                            "in vec2 uv; uniform sampler2D source; out vec4 color;"
                            "void main(){color=vec4(texture(source,uv).rgb,1.0);}";
-    // ST 2084 decode and encode permit calibration in absolute light rather
-    // than scaling PQ code values, which would distort shadows and black.
-    const char *unpack = R"GLSL(#version 330
-uniform usampler2D source;
-uniform float peak, gray;
-out vec4 color;
-vec3 decodePQ(vec3 v) {
-    vec3 p = pow(v, vec3(32.0 / 2523.0));
-    return 10000.0 * pow(max(p - 0.8359375, 0.0) /
-        (18.8515625 - 18.6875 * p), vec3(16384.0 / 2610.0));
-}
-vec3 encodePQ(vec3 nits) {
-    vec3 p = pow(clamp(nits / 10000.0, 0.0, 1.0), vec3(2610.0 / 16384.0));
-    return pow((0.8359375 + 18.8515625 * p) / (1.0 + 18.6875 * p), vec3(2523.0 / 32.0));
-}
-void main() {
-    uint p = texelFetch(source, ivec2(gl_FragCoord.xy), 0).r;
-    vec3 code = vec3(p & 1023u, (p >> 10) & 1023u, (p >> 20) & 1023u) / 1023.0;
-    if (peak > 1000.0) {
-        float nativeGray = clamp(floor(gray * 1000.0 / peak + 0.5), 10.0, 100.0);
-        vec3 light = decodePQ(code);
-        // When the model's minimum gray is reached, interpolate through the
-        // requested gray anchor and peak rather than lifting the midtones.
-        if (gray * 1000.0 / peak < 10.0) {
-            vec3 low = light * (gray / nativeGray);
-            vec3 high = gray + (light - nativeGray) * (peak - gray) / (1000.0 - nativeGray);
-            light = mix(low, high, greaterThan(light, vec3(nativeGray)));
-        } else {
-            light *= peak / 1000.0;
-        }
-        code = encodePQ(light);
-    }
-    // The stream advertises a fixed 2000-nit mastering ceiling so that live
-    // peak adjustments never invalidate encoder metadata.
-    color = vec4(min(code, vec3(846.0 / 1023.0)), 1.0);
-})GLSL";
-    const char *fallback = R"GLSL(#version 330
-uniform sampler2D source;
-uniform float white_nits;
-out vec4 color;
-void main() {
-    vec3 c = texelFetch(source, ivec2(gl_FragCoord.xy), 0).rgb;
-    vec3 linear = mix(c / 12.92, pow((c + 0.055) / 1.055, vec3(2.4)),
-                      greaterThan(c, vec3(0.04045)));
-    // Convert linear BT.709 primaries to BT.2020 before PQ encoding.
-    vec3 wide = mat3(0.627404, 0.069097, 0.016391,
-                     0.329283, 0.919540, 0.088013,
-                     0.043313, 0.011362, 0.895595) * linear;
-    vec3 p = pow(max(wide, 0.0) * (white_nits / 10000.0), vec3(2610.0 / 16384.0));
-    color = vec4(pow((0.8359375 + 18.8515625 * p) / (1.0 + 18.6875 * p),
-                     vec3(2523.0 / 32.0)), 1.0);
-})GLSL";
     GLuint vs = shader(GL_VERTEX_SHADER, vertex), fs = 0;
     try {
         fs = shader(GL_FRAGMENT_SHADER, fragment);
@@ -231,42 +174,6 @@ void main() {
         throw std::runtime_error("effect shader link failed");
     glUseProgram(program);
     glUniform1i(glGetUniformLocation(program, "source"), 0);
-    vs = shader(GL_VERTEX_SHADER, vertex);
-    try {
-        fs = shader(GL_FRAGMENT_SHADER, unpack);
-    } catch (...) {
-        glDeleteShader(vs);
-        throw;
-    }
-    output_program = glCreateProgram();
-    glAttachShader(output_program, vs);
-    glAttachShader(output_program, fs);
-    glLinkProgram(output_program);
-    glDeleteShader(vs);
-    glDeleteShader(fs);
-    glGetProgramiv(output_program, GL_LINK_STATUS, &linked);
-    if (!linked)
-        throw std::runtime_error("HDR unpack shader link failed");
-    glUseProgram(output_program);
-    glUniform1i(glGetUniformLocation(output_program, "source"), 0);
-    vs = shader(GL_VERTEX_SHADER, vertex);
-    try {
-        fs = shader(GL_FRAGMENT_SHADER, fallback);
-    } catch (...) {
-        glDeleteShader(vs);
-        throw;
-    }
-    fallback_program = glCreateProgram();
-    glAttachShader(fallback_program, vs);
-    glAttachShader(fallback_program, fs);
-    glLinkProgram(fallback_program);
-    glDeleteShader(vs);
-    glDeleteShader(fs);
-    glGetProgramiv(fallback_program, GL_LINK_STATUS, &linked);
-    if (!linked)
-        throw std::runtime_error("SDR fallback shader link failed");
-    glUseProgram(fallback_program);
-    glUniform1i(glGetUniformLocation(fallback_program, "source"), 0);
     glDisable(GL_DITHER);
     glDisable(GL_BLEND);
     glDisable(GL_FRAMEBUFFER_SRGB);
@@ -306,29 +213,18 @@ EGLImageKHR Surface::import(const AmaterasuDmaBufFrame &frame) {
 }
 
 void Surface::wait_acquire(int fence_fd) {
-    if (fence_fd < 0)
-        return;
-    if (create_sync && destroy_sync && wait_sync) {
-        // The producer keeps its fence until release; EGL consumes a duplicate.
-        const int duplicate = ::fcntl(fence_fd, F_DUPFD_CLOEXEC, 0);
-        if (duplicate >= 0) {
-            const EGLint attributes[] = {EGL_SYNC_NATIVE_FENCE_FD_ANDROID, duplicate, EGL_NONE};
-            EGLSyncKHR sync = create_sync(display, EGL_SYNC_NATIVE_FENCE_ANDROID, attributes);
-            if (sync != EGL_NO_SYNC_KHR) {
-                // A queued server wait orders every later command in this
-                // context after the producer's writes without a CPU stall.
-                const EGLBoolean queued = wait_sync(display, sync, 0);
-                destroy_sync(display, sync);
-                if (queued == EGL_TRUE)
-                    return;
-                // EGL owns the duplicate once the sync exists. Without a
-                // queued wait, fall back to the producer's fence below.
-            } else {
-                ::close(duplicate);
-            }
-        }
+    if (fence_fd < 0) return;
+    const int duplicate = ::fcntl(fence_fd, F_DUPFD_CLOEXEC, 0);
+    if (duplicate < 0) throw std::runtime_error("cannot duplicate input dependency");
+    const EGLint attributes[] = {EGL_SYNC_NATIVE_FENCE_FD_ANDROID, duplicate, EGL_NONE};
+    EGLSyncKHR sync = create_sync(display, EGL_SYNC_NATIVE_FENCE_ANDROID, attributes);
+    if (sync == EGL_NO_SYNC_KHR) {
+        ::close(duplicate);
+        throw std::runtime_error("cannot import input dependency");
     }
-    wait_fence(fence_fd);
+    const EGLBoolean queued = wait_sync(display, sync, 0);
+    destroy_sync(display, sync);
+    if (queued != EGL_TRUE) throw std::runtime_error("cannot queue GPU input dependency");
 }
 
 // The caller has already queued the producer's acquire-fence wait.
@@ -360,78 +256,21 @@ void Surface::capture(const AmaterasuDmaBufFrame &frame) {
 }
 
 int Surface::complete() {
-    // The fence follows the input read and output draw in this context, and
-    // the CUDA unmap orders the model's writes before that draw. Its owner
-    // hands it downstream as the output's acquire fence and waits on it before
-    // releasing the borrowed input, so no thread blocks here on GPU progress.
-    // Without native fences, complete synchronously and return no fence.
-    if (!create_sync || !destroy_sync || !duplicate_fence) {
-        glFinish();
-        return -1;
-    }
     EGLSyncKHR sync = create_sync(display, EGL_SYNC_NATIVE_FENCE_ANDROID, nullptr);
-    if (sync == EGL_NO_SYNC_KHR) {
-        glFinish();
-        return -1;
-    }
-    // The native fence exists only once its command reaches the GPU queue.
+    if (sync == EGL_NO_SYNC_KHR) throw std::runtime_error("cannot create input read completion");
     glFlush();
     const int fd = duplicate_fence(display, sync);
     destroy_sync(display, sync);
-    if (fd < 0) {
-        glFinish();
-        return -1;
-    }
+    if (fd < 0) throw std::runtime_error("cannot export input read completion");
     return fd;
 }
 
 void Surface::close() {
     glDeleteFramebuffers(1, &input_fbo);
-    glDeleteFramebuffers(1, &output_fbo);
     glDeleteTextures(1, &input);
-    glDeleteTextures(1, &output);
     glDeleteTextures(1, &source);
     glDeleteVertexArrays(1, &vao);
     glDeleteProgram(program);
-    glDeleteProgram(output_program);
-    glDeleteProgram(fallback_program);
 }
 
-void Output::open(Surface &surface, uint32_t width, uint32_t height, uint32_t format) {
-    for (auto &plane : frame.planes)
-        plane = {-1, -1, 0, 0};
-    buffer = gbm_bo_create(surface.gbm, width, height, format, GBM_BO_USE_RENDERING);
-    if (!buffer || gbm_bo_get_plane_count(buffer) != 1)
-        throw std::runtime_error("HDR output allocation failed");
-    frame.width = width;
-    frame.height = height;
-    frame.fourcc = format;
-    frame.plane_count = 1;
-    frame.color = AMATERASU_DMABUF_COLOR_BT2020_PQ;
-    frame.modifier = gbm_bo_get_modifier(buffer);
-    frame.planes[0].fd = gbm_bo_get_fd(buffer);
-    frame.planes[0].pitch = gbm_bo_get_stride(buffer);
-    frame.planes[0].offset = gbm_bo_get_offset(buffer, 0);
-    if (frame.planes[0].fd < 0)
-        throw std::runtime_error("HDR output export failed");
-    image = surface.import(frame);
-    glGenTextures(1, &texture);
-    glBindTexture(GL_TEXTURE_2D, texture);
-    surface.bind_image(GL_TEXTURE_2D, image);
-    framebuffer(texture, fbo);
-    gl_check("HDR output import failed");
-}
-void Output::close(Surface &surface) {
-    // A rejected delivery can release the last reference before anyone waited
-    // on the output fence. Retire this context's queued writes before freeing.
-    glFinish();
-    glDeleteFramebuffers(1, &fbo);
-    glDeleteTextures(1, &texture);
-    if (image != EGL_NO_IMAGE_KHR)
-        surface.destroy_image(surface.display, image);
-    if (frame.planes[0].fd >= 0)
-        ::close(frame.planes[0].fd);
-    if (buffer)
-        gbm_bo_destroy(buffer);
-}
 } // namespace rtx

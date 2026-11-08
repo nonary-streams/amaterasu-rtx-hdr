@@ -1,8 +1,8 @@
 use super::*;
-use amaterasu_module_sdk::processing::{
-    ProcessingOutcome, configure_gpu_stream, into_gpu_binding, process_gpu, update_gpu_stream,
+use amaterasu_module_sdk::frame_processing::{
+    configure_frame_stream, into_frame_processor_binding, update_frame_stream,
 };
-
+use std::cell::Cell;
 fn settings() -> Settings {
     serde_json::from_value(serde_json::json!({"runtime_directory":"/runtime"})).unwrap()
 }
@@ -137,62 +137,6 @@ fn foreground_demand_counts_each_stream_and_clears_on_shutdown() {
 }
 
 #[test]
-fn unsupported_input_is_rejected_before_loading_vendor_code() {
-    let mut processor = Processor::new(settings());
-    let mut source = frame();
-    for change in 0..4 {
-        match change {
-            0 => source.color = DMABUF_COLOR_BT2020_PQ,
-            1 => {
-                source.color = DMABUF_COLOR_SRGB;
-                source.fourcc = u32::from_le_bytes(*b"NV12");
-            }
-            2 => {
-                source.fourcc = u32::from_le_bytes(*b"XR24");
-                source.width = 8;
-            }
-            _ => {
-                source.width = 256;
-                source.plane_count = 2;
-            }
-        }
-        assert!(!supported_input(&source));
-    }
-    processor.cancel(7);
-    assert!(processor.retired.contains(&7));
-    // A cancelled identity cannot create a new native stream.
-    let raw = into_gpu_binding(processor);
-    unsafe {
-        let api = &*raw;
-        let input = DmaBufFrameLease {
-            frame: frame(),
-            context: std::ptr::dangling_mut::<u8>().cast(),
-            retain: Some(input_retain),
-            release: Some(input_release),
-        };
-        assert_eq!(
-            process_gpu(api, 7, &input, CAPTURE_FRAME_FRESH, |_| panic!(
-                "unexpected delivery"
-            )),
-            ProcessingOutcome::Failed(MEDIA_CLOSED)
-        );
-        api.base.release.unwrap()(api.base.context);
-    }
-}
-
-#[test]
-fn packed_rgb_sdr_accepts_both_scanout_depths_without_accepting_hdr() {
-    for format in [
-        *b"XR24", *b"AR24", *b"XB24", *b"AB24", *b"XR30", *b"AR30", *b"XB30", *b"AB30",
-    ] {
-        let mut input = frame();
-        input.fourcc = u32::from_le_bytes(format);
-        assert!(supported_input(&input));
-        input.color = DMABUF_COLOR_BT2020_PQ;
-        assert!(!supported_input(&input));
-    }
-}
-#[test]
 fn stream_controls_update_atomically_and_retire_with_stream() {
     let mut processor = Processor::new(settings());
     let json = br#"{"rtx_hdr_enable":true,"rtx_hdr_peak_brightness":1400,"rtx_hdr_middle_gray":50,"rtx_hdr_contrast":5,"rtx_hdr_saturation":-5,"rtx_hdr_debanding":true}"#;
@@ -238,20 +182,23 @@ fn sdk_toggle_preserves_scope_metadata_and_atomic_rejection() {
     assert!(!processor.stream_settings[&77].enabled);
     let metadata = processor.hdr_metadata(77).unwrap();
     let target = processor.targets[&77].clone();
-    let raw = into_gpu_binding(processor);
+    let mut fresh = Processor::new(settings());
+    fresh.device_uuid = Some([1; 16]);
+    let raw = into_frame_processor_binding(fresh);
     // SAFETY: the SDK owns this live binding until its explicit release below.
     let api = unsafe { &*raw };
+    unsafe { configure_frame_stream(api, 77, &serde_json::to_vec(&controls).unwrap()) }.unwrap();
     for enabled in [true, false, true] {
         controls["rtx_hdr_enable"] = enabled.into();
         assert_eq!(
-            unsafe { update_gpu_stream(api, 77, &serde_json::to_vec(&controls).unwrap()) },
+            unsafe { update_frame_stream(api, 77, &serde_json::to_vec(&controls).unwrap()) },
             Ok(())
         );
         let mut invalid = controls.clone();
         invalid["rtx_hdr_enable"] = (!enabled).into();
         invalid["rtx_hdr_peak_brightness"] = 2001.into();
         assert_eq!(
-            unsafe { update_gpu_stream(api, 77, &serde_json::to_vec(&invalid).unwrap()) },
+            unsafe { update_frame_stream(api, 77, &serde_json::to_vec(&invalid).unwrap()) },
             Err(STATUS_INVALID_ARGUMENT)
         );
     }
@@ -259,85 +206,89 @@ fn sdk_toggle_preserves_scope_metadata_and_atomic_rejection() {
     // cannot be replaced by a settings update.
     let mut hijack = controls.clone();
     hijack["foreground_target"]["generation"] = 2.into();
-    assert!(unsafe { update_gpu_stream(api, 77, &serde_json::to_vec(&hijack).unwrap()) }.is_err());
+    assert!(
+        unsafe { update_frame_stream(api, 77, &serde_json::to_vec(&hijack).unwrap()) }.is_err()
+    );
     assert!(target.is_some());
     assert_eq!(metadata.enabled, 1);
     unsafe {
-        (api.cancel_dmabuf_leases)(api.base.context, 77);
+        (api.base.base.cancel)(api.base.base.base.context, 77);
         assert_eq!(
-            update_gpu_stream(api, 77, &serde_json::to_vec(&controls).unwrap()),
+            update_frame_stream(api, 77, &serde_json::to_vec(&controls).unwrap()),
             Err(MEDIA_CLOSED)
         );
-        api.base.release.unwrap()(api.base.context);
-    }
-}
-unsafe extern "C" fn input_retain(_: *mut c_void) -> Status {
-    STATUS_OK
-}
-unsafe extern "C" fn input_release(_: *mut c_void, fence: i32) {
-    if fence >= 0 {
-        // SAFETY: the lease ABI transfers ownership of a nonnegative fence.
-        unsafe { libc::close(fence) };
+        api.base.base.base.release.unwrap()(api.base.base.base.context);
     }
 }
 
-/// An input provider that counts the processor's independent references and
-/// waits on each completion fence, as the capture provider does before reuse.
-struct CountingInput {
-    source: Source,
-    references: Cell<i32>,
-    fenced_releases: Cell<u32>,
-}
-impl CountingInput {
-    fn lease(&self) -> DmaBufFrameLease {
-        DmaBufFrameLease {
-            context: std::ptr::from_ref(self).cast_mut().cast(),
-            retain: Some(counting_retain),
-            release: Some(counting_release),
-            ..self.source.lease()
+const NONE: FrameDescriptor = FrameDescriptor {
+    kind: FRAME_SYNC_NONE,
+    version: 0,
+    size: 0,
+    reserved: 0,
+    namespace: [0; 16],
+    data: std::ptr::null(),
+};
+#[test]
+fn input_negotiation_covers_cpu_and_both_rgb_depths_without_loading_vendor_code() {
+    let offers = input::InputOffers::new();
+    let (generation, list) = offers.enumerate();
+    assert_eq!(list.len(), 14);
+    for source in &list {
+        let mut producer = *source;
+        let mut dmabuf = None;
+        if source.resource.kind == FRAME_RESOURCE_DMABUF {
+            let mut caps = unsafe {
+                source
+                    .resource
+                    .data
+                    .cast::<DmaBufResourceCapabilities>()
+                    .read_unaligned()
+            };
+            caps.modifier = 0x1234;
+            dmabuf = Some(caps);
+            producer.resource.data = std::ptr::from_ref(dmabuf.as_ref().unwrap()).cast();
         }
+        assert!(offers.select(generation, source.id, &producer).is_ok());
+        producer.ownership = FRAME_OWNERSHIP_BORROWED;
+        assert!(offers.select(generation, source.id, &producer).is_err());
+        let _ = dmabuf;
     }
 }
-unsafe extern "C" fn counting_retain(context: *mut c_void) -> Status {
-    let input = unsafe { &*context.cast::<CountingInput>() };
-    input.references.set(input.references.get() + 1);
-    STATUS_OK
+#[test]
+fn hdr_and_unknown_cpu_color_are_rejected_without_vendor_initialization() {
+    let offers = input::InputOffers::new();
+    let (generation, list) = offers.enumerate();
+    let mut source = list[0];
+    let mut caps = unsafe {
+        source
+            .resource
+            .data
+            .cast::<DmaBufResourceCapabilities>()
+            .read_unaligned()
+    };
+    caps.color = DMABUF_COLOR_BT2020_PQ;
+    source.resource.data = std::ptr::from_ref(&caps).cast();
+    assert!(offers.select(generation, source.id, &source).is_err());
+    let mut source = list[8];
+    let mut caps = unsafe {
+        source
+            .resource
+            .data
+            .cast::<CpuResourceCapabilitiesV2>()
+            .read_unaligned()
+    };
+    caps.color = FrameColorMetadata::default();
+    source.resource.data = std::ptr::from_ref(&caps).cast();
+    assert!(offers.select(generation, source.id, &source).is_err());
 }
-unsafe extern "C" fn counting_release(context: *mut c_void, fence: i32) {
-    let input = unsafe { &*context.cast::<CountingInput>() };
-    if fence >= 0 {
-        assert_eq!(unsafe { am_rtx_wait_fence(fence) }, 0, "completion fence");
-        unsafe { libc::close(fence) };
-        input.fenced_releases.set(input.fenced_releases.get() + 1);
-    }
-    input.references.set(input.references.get() - 1);
-    assert!(input.references.get() >= 0, "release without retain");
-}
-
 unsafe extern "C" {
-    fn am_rtx_test_source(context: *mut c_void, frame: *mut DmaBufFrame) -> *mut c_void;
     fn am_rtx_test_source_format(
         context: *mut c_void,
         frame: *mut DmaBufFrame,
         format: u32,
     ) -> *mut c_void;
-    fn am_rtx_test_fill_source(
-        context: *mut c_void,
-        source: *mut c_void,
-        red: f32,
-        green: f32,
-        blue: f32,
-    ) -> i32;
-    fn am_rtx_test_native_fence_available(context: *mut c_void) -> i32;
-    fn am_rtx_test_disable_native_fence(context: *mut c_void);
-    fn am_rtx_test_read(
-        context: *mut c_void,
-        output: *mut c_void,
-        pixels: *mut u32,
-        length: usize,
-    ) -> i32;
-    fn am_rtx_test_read_vendor(context: *mut c_void, pixels: *mut u32, length: usize) -> i32;
-    fn am_rtx_test_fence(context: *mut c_void) -> i32;
+    fn am_rtx_test_source_close(context: *mut c_void, source: *mut c_void);
     fn am_rtx_test_read_cuda(
         context: *mut c_void,
         pointer: u64,
@@ -345,63 +296,259 @@ unsafe extern "C" {
         pixels: *mut u32,
         length: usize,
     ) -> i32;
+    fn am_rtx_test_fence(context: *mut c_void) -> i32;
 }
 struct Source {
     session: Rc<NativeSession>,
     raw: *mut c_void,
     frame: DmaBufFrame,
+    next_frame: DmaBufFrame,
+    references: Cell<usize>,
+    fenced_releases: Cell<usize>,
 }
 impl Source {
-    fn new(session: Rc<NativeSession>) -> Self {
-        Self::new_format(session, None)
-    }
-    fn new_format(session: Rc<NativeSession>, format: Option<u32>) -> Self {
+    fn new(session: Rc<NativeSession>, format: u32) -> Box<Self> {
         let mut frame = frame();
-        let raw = unsafe {
-            match format {
-                Some(format) => am_rtx_test_source_format(session.0.as_ptr(), &mut frame, format),
-                None => am_rtx_test_source(session.0.as_ptr(), &mut frame),
-            }
-        };
-        assert!(!raw.is_null(), "GPU test source allocation failed");
-        frame.timestamp_us = 66;
+        let raw = unsafe { am_rtx_test_source_format(session.0.as_ptr(), &mut frame, format) };
+        assert!(!raw.is_null());
         frame.sequence = 1;
+        frame.timestamp_us = 66;
         frame.planes[0].acquire_fence_fd = unsafe { am_rtx_test_fence(session.0.as_ptr()) };
-        assert!(
-            frame.planes[0].acquire_fence_fd >= 0,
-            "native acquire fence"
-        );
-        Self {
+        assert!(frame.planes[0].acquire_fence_fd >= 0);
+        let mut next_frame = frame;
+        next_frame.sequence = 2;
+        Box::new(Self {
             session,
             raw,
             frame,
-        }
+            next_frame,
+            references: Cell::new(0),
+            fenced_releases: Cell::new(0),
+        })
     }
-    fn lease(&self) -> DmaBufFrameLease {
-        DmaBufFrameLease {
-            frame: self.frame,
+    fn offer(&self) -> (DmaBufResourceCapabilities, CaptureResourceOffer) {
+        let caps = DmaBufResourceCapabilities {
+            fourcc: self.frame.fourcc,
+            color: self.frame.color,
+            modifier: self.frame.modifier,
+            min_width: self.frame.width,
+            max_width: self.frame.width,
+            min_height: self.frame.height,
+            max_height: self.frame.height,
+            device_id: [0; 16],
+        };
+        (
+            caps,
+            CaptureResourceOffer {
+                id: 1,
+                ownership: FRAME_OWNERSHIP_RETAINABLE,
+                accessibility: FRAME_ACCESS_GPU,
+                reserved: 0,
+                resource: FrameDescriptor {
+                    kind: FRAME_RESOURCE_DMABUF,
+                    version: 1,
+                    size: size_of::<DmaBufResourceCapabilities>() as u32,
+                    reserved: 0,
+                    namespace: [0; 16],
+                    data: std::ptr::null(),
+                },
+                acquire_sync: NONE,
+                completion_sync: FrameDescriptor {
+                    kind: FRAME_SYNC_SYNC_FILE,
+                    version: 1,
+                    ..NONE
+                },
+            },
+        )
+    }
+    fn resource(&self, sequence: u64, freshness: u32) -> CaptureResourceFrame {
+        CaptureResourceFrame {
+            offer_generation: 1,
+            offer_id: 1,
+            width: self.frame.width,
+            height: self.frame.height,
+            timestamp_us: 66,
+            sequence,
+            capture_pacing_timestamp_us: 99,
+            freshness,
+            reserved: 0,
+            color: FrameColorMetadata {
+                version: 1,
+                size: size_of::<FrameColorMetadata>() as u32,
+                primaries: FRAME_PRIMARIES_BT709,
+                transfer: FRAME_TRANSFER_SRGB,
+                matrix: FRAME_MATRIX_RGB,
+                range: FRAME_RANGE_FULL,
+            },
+            clock: FrameClockMetadata::default(),
+            pacing_clock: FrameClockMetadata::default(),
+            resource: FrameDescriptor {
+                kind: FRAME_RESOURCE_DMABUF,
+                version: 1,
+                size: size_of::<DmaBufFrame>() as u32,
+                reserved: 0,
+                namespace: [0; 16],
+                data: std::ptr::from_ref(if sequence == 1 {
+                    &self.frame
+                } else {
+                    &self.next_frame
+                })
+                .cast(),
+            },
+            acquire_sync: NONE,
             context: std::ptr::from_ref(self).cast_mut().cast(),
-            retain: Some(input_retain),
-            release: Some(input_release),
+            retain: retain_source,
+            release: release_source,
         }
     }
 }
 impl Drop for Source {
     fn drop(&mut self) {
+        assert_eq!(self.references.get(), 0);
         unsafe {
             libc::close(self.frame.planes[0].acquire_fence_fd);
-            am_rtx_output_close(self.session.0.as_ptr(), self.raw);
+            am_rtx_test_source_close(self.session.0.as_ptr(), self.raw);
         }
     }
 }
-fn read(lease: &DmaBufFrameLease) -> Vec<u32> {
-    let state = unsafe { &*lease.context.cast::<Lease>() };
-    let mut pixels = vec![0; lease.frame.width as usize * lease.frame.height as usize];
+unsafe extern "C" fn retain_source(c: *mut c_void) -> Status {
+    let source = unsafe { &*c.cast::<Source>() };
+    source.references.set(source.references.get() + 1);
+    STATUS_OK
+}
+unsafe extern "C" fn release_source(c: *mut c_void, d: *const FrameDescriptor) {
+    let source = unsafe { &*c.cast::<Source>() };
+    let d = unsafe { &*d };
+    if d.kind == FRAME_SYNC_SYNC_FILE {
+        let fd = unsafe { (*d.data.cast::<FrameSyncFile>()).fd };
+        let mut p = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert!(unsafe { libc::poll(&mut p, 1, 1000) } > 0);
+        source.fenced_releases.set(source.fenced_releases.get() + 1);
+    } else {
+        assert_eq!(d.kind, FRAME_SYNC_NONE);
+    }
+    source
+        .references
+        .set(source.references.get().checked_sub(1).unwrap());
+}
+struct Binding(*const FrameProcessorApi);
+impl Binding {
+    fn api(&self) -> &FrameProcessorApi {
+        unsafe { &*self.0 }
+    }
+    fn new(config: Settings) -> Self {
+        let b = Self(into_frame_processor_binding(Processor::new(config)));
+        unsafe { configure_frame_stream(b.api(), 77, br#"{"rtx_hdr_enable":true}"#) }.unwrap();
+        b
+    }
+    fn negotiate(&self, source: &CaptureResourceOffer) {
+        let api = self.api();
+        let context = api.base.base.base.context;
+        let mut inputs = Vec::<u64>::new();
+        let mut generation = 0;
+        unsafe extern "C" fn collect(c: *mut c_void, o: *const CaptureResourceOffer) -> Status {
+            unsafe { &mut *c.cast::<Vec<u64>>() }.push(unsafe { (*o).id });
+            STATUS_OK
+        }
+        assert_eq!(
+            unsafe {
+                (api.base.base.enumerate_resources)(
+                    context,
+                    77,
+                    CaptureResourceOfferSink {
+                        context: std::ptr::from_mut(&mut inputs).cast(),
+                        write: collect,
+                    },
+                    &mut generation,
+                )
+            },
+            STATUS_OK
+        );
+        assert!(inputs.into_iter().any(|id| unsafe {
+            (api.base.base.configure)(context, 77, generation, id, 1, source)
+        } == STATUS_OK));
+        let mut outputs = Vec::<u64>::new();
+        assert_eq!(
+            unsafe {
+                (api.base.enumerate_outputs)(
+                    context,
+                    77,
+                    CaptureResourceOfferSink {
+                        context: std::ptr::from_mut(&mut outputs).cast(),
+                        write: collect,
+                    },
+                    &mut generation,
+                )
+            },
+            STATUS_OK
+        );
+        assert_eq!(
+            unsafe { (api.base.select_output)(context, 77, generation, outputs[0]) },
+            STATUS_OK
+        );
+    }
+    fn process(&self, frame: &CaptureResourceFrame) -> Result<CaptureResourceFrame, Status> {
+        let mut output = None;
+        unsafe extern "C" fn receive(c: *mut c_void, f: *const CaptureResourceFrame) -> Status {
+            let frame = unsafe { &*f };
+            let status = unsafe { (frame.retain)(frame.context) };
+            if status == STATUS_OK {
+                unsafe { &mut *c.cast::<Option<CaptureResourceFrame>>() }.replace(*frame);
+            }
+            status
+        }
+        let api = self.api();
+        let result = unsafe {
+            (api.base.process)(
+                api.base.base.base.context,
+                77,
+                frame,
+                CaptureResourceFrameSink {
+                    context: std::ptr::from_mut(&mut output).cast(),
+                    write: receive,
+                },
+            )
+        };
+        if result == STATUS_OK {
+            Ok(output.unwrap())
+        } else {
+            assert!(output.is_none());
+            Err(result)
+        }
+    }
+}
+impl Drop for Binding {
+    fn drop(&mut self) {
+        let api = self.api();
+        unsafe {
+            (api.base.base.cancel)(api.base.base.base.context, 77);
+            api.base.base.base.release.unwrap()(api.base.base.base.context);
+        }
+    }
+}
+fn gpu_settings() -> Settings {
+    let mut s = settings();
+    s.runtime_directory = std::env::var_os("AMATERASU_TRUEHDR_RUNTIME")
+        .expect("licensed runtime path")
+        .into();
+    s.output_buffers = 1;
+    s
+}
+fn read(session: &NativeSession, frame: &CaptureResourceFrame) -> Vec<u32> {
+    assert_eq!(frame.resource.kind, FRAME_RESOURCE_CUDA_DEVICE);
+    assert_eq!(frame.acquire_sync.kind, FRAME_SYNC_CUDA_EVENT);
+    let cuda = unsafe { *frame.resource.data.cast::<CudaDeviceFrame>() };
+    let mut pixels = vec![0; frame.width as usize * frame.height as usize];
     assert_eq!(
         unsafe {
-            am_rtx_test_read(
-                state.slot.session.0.as_ptr(),
-                state.slot.output.as_ptr(),
+            am_rtx_test_read_cuda(
+                session.0.as_ptr(),
+                cuda.device_pointer,
+                cuda.pitch,
                 pixels.as_mut_ptr(),
                 pixels.len(),
             )
@@ -410,1033 +557,194 @@ fn read(lease: &DmaBufFrameLease) -> Vec<u32> {
     );
     pixels
 }
-
-fn nits(code: u32) -> f64 {
-    let p = (f64::from(code) / 1023.0).powf(32.0 / 2523.0);
-    10000.0 * ((p - 0.8359375).max(0.0) / (18.8515625 - 18.6875 * p)).powf(16384.0 / 2610.0)
+unsafe fn release(frame: CaptureResourceFrame) {
+    unsafe { (frame.release)(frame.context, &NONE) };
 }
-
 #[test]
-#[ignore = "opt-in GPU timing fixture; requires NVIDIA RTX and AMATERASU_TRUEHDR_RUNTIME"]
-fn nvidia_benchmark_frame_processing() {
-    let mut config = settings();
-    config.runtime_directory = std::env::var_os("AMATERASU_TRUEHDR_RUNTIME")
-        .expect("runtime path")
-        .into();
-    let width = std::env::var("AMATERASU_RTX_BENCH_WIDTH")
-        .unwrap_or_else(|_| "512".into())
-        .parse::<u32>()
-        .unwrap();
-    let height = std::env::var("AMATERASU_RTX_BENCH_HEIGHT")
-        .unwrap_or_else(|_| "288".into())
-        .parse::<u32>()
-        .unwrap();
-    assert!((16..=8192).contains(&width) && (16..=8192).contains(&height));
-    let stream = Stream::open(&config, width, height, None).unwrap();
-    let source = Source::new(stream.slots[0].session.clone());
-    let mut processor = Processor::new(config);
-    processor.streams.insert(77, stream);
-    let raw = into_gpu_binding(processor);
-    let api = unsafe { &*raw };
-    let input = source.lease();
-    let process = || unsafe { process_gpu(api, 77, &input, CAPTURE_FRAME_FRESH, |_| STATUS_OK) };
-    for _ in 0..10 {
-        assert_eq!(process(), ProcessingOutcome::Accepted);
-    }
-    let mut before = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    let mut after = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    assert_eq!(
-        unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut before) },
-        0
-    );
-    let started = std::time::Instant::now();
-    for _ in 0..100 {
-        assert_eq!(process(), ProcessingOutcome::Accepted);
-    }
-    let elapsed = started.elapsed();
-    assert_eq!(
-        unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut after) },
-        0
-    );
-    let cpu_ns = (after.tv_sec - before.tv_sec) as i128 * 1_000_000_000
-        + (after.tv_nsec - before.tv_nsec) as i128;
-    eprintln!(
-        "RTX HDR benchmark {width}x{height}: 100 frames, wall_us={}, thread_cpu_us={}",
-        elapsed.as_micros(),
-        cpu_ns / 1000
-    );
-    unsafe {
-        (api.cancel_dmabuf_leases)(api.base.context, 77);
-        api.base.release.unwrap()(api.base.context);
+#[ignore = "requires NVIDIA RTX and AMATERASU_TRUEHDR_RUNTIME; run only with the stream idle"]
+fn nvidia_dma_inputs_produce_hdr_pixels_and_one_buffer_backpressure_without_copying_output() {
+    for format in [*b"AB24", *b"AB30"] {
+        let config = gpu_settings();
+        let fixture = Stream::open(&config, 512, 288, None).unwrap();
+        let source = Source::new(fixture.session.clone(), u32::from_le_bytes(format));
+        let binding = Binding::new(config);
+        let (caps, mut offer) = source.offer();
+        offer.resource.data = std::ptr::from_ref(&caps).cast();
+        binding.negotiate(&offer);
+        let first = binding
+            .process(&source.resource(1, CAPTURE_FRAME_FRESH))
+            .unwrap();
+        assert_eq!(first.color.transfer, FRAME_TRANSFER_PQ);
+        assert_eq!(first.capture_pacing_timestamp_us, 99);
+        let pixels = read(&source.session, &first);
+        assert_ne!(pixels[0] & 0x3fff_ffff, pixels[511] & 0x3fff_ffff);
+        // A separate reader pins the immutable output while another step runs.
+        assert!(matches!(
+            binding.process(&source.resource(2, CAPTURE_FRAME_FRESH)),
+            Err(MEDIA_BUSY)
+        ));
+        assert_eq!(read(&source.session, &first), pixels);
+        unsafe { release(first) };
+        let second = binding
+            .process(&source.resource(2, CAPTURE_FRAME_FRESH))
+            .unwrap();
+        let after = read(&source.session, &second);
+        unsafe { release(second) };
+        let cached = binding
+            .process(&source.resource(2, CAPTURE_FRAME_CACHED_REUSE))
+            .unwrap();
+        assert_eq!(cached.freshness, CAPTURE_FRAME_CACHED_REUSE);
+        assert_eq!(read(&source.session, &cached), after);
+        unsafe { release(cached) };
+        drop(binding);
+        assert_eq!(source.references.get(), 0);
+        assert!(source.fenced_releases.get() > 0);
     }
 }
-
 #[test]
-#[ignore = "requires an NVIDIA RTX GPU and AMATERASU_TRUEHDR_RUNTIME"]
-fn nvidia_repeated_unchanged_frame_has_identical_output() {
-    let mut config = settings();
-    config.runtime_directory = std::env::var_os("AMATERASU_TRUEHDR_RUNTIME")
-        .expect("runtime path")
-        .into();
-    let stream = Stream::open(&config, 512, 288, None).unwrap();
-    let source = Source::new(stream.slots[0].session.clone());
-    let mut processor = Processor::new(config);
-    processor.streams.insert(77, stream);
-    let raw = into_gpu_binding(processor);
-    let api = unsafe { &*raw };
-    let mut baseline = None;
-    for _ in 0..8 {
-        let result = unsafe {
-            process_gpu(api, 77, &source.lease(), CAPTURE_FRAME_FRESH, |output| {
-                let pixels = read(output);
-                if let Some(previous) = &baseline {
-                    assert_eq!(&pixels, previous);
-                } else {
-                    baseline = Some(pixels);
-                }
-                STATUS_OK
-            })
-        };
-        assert_eq!(result, ProcessingOutcome::Accepted);
-    }
-    unsafe {
-        (api.cancel_dmabuf_leases)(api.base.context, 77);
-        api.base.release.unwrap()(api.base.context);
-    }
-}
-
-#[test]
-#[ignore = "requires an NVIDIA RTX GPU and AMATERASU_TRUEHDR_RUNTIME"]
-fn nvidia_cached_frame_survives_rejection_and_invalidates_on_change() {
-    let mut config = settings();
-    config.runtime_directory = std::env::var_os("AMATERASU_TRUEHDR_RUNTIME")
-        .expect("runtime path")
-        .into();
-    config.output_buffers = 2;
-    let stream = Stream::open(&config, 512, 288, None).unwrap();
-    let session = stream.slots[0].session.clone();
-    let source = Source::new(session.clone());
-    let mut processor = Processor::new(config);
-    let (mut controls, _) = intent_settings();
-    processor
-        .configure_stream(77, &serde_json::to_vec(&controls).unwrap())
-        .unwrap();
-    processor.streams.insert(77, stream);
-    let raw = into_gpu_binding(processor);
-    let api = unsafe { &*raw };
-    let mut rejected_context = std::ptr::null_mut();
-    let initial = source.lease();
-    assert_eq!(
-        unsafe {
-            process_gpu(api, 77, &initial, CAPTURE_FRAME_FRESH, |output| {
-                rejected_context = output.context;
-                MEDIA_BUSY
-            })
-        },
-        ProcessingOutcome::Busy
-    );
-
-    let mut repeated = initial;
-    repeated.frame.timestamp_us += 100;
-    let mut held = None;
-    assert_eq!(
-        unsafe {
-            process_gpu(api, 77, &repeated, CAPTURE_FRAME_CACHED_REUSE, |output| {
-                assert_eq!(output.context, rejected_context);
-                assert_eq!(output.frame.timestamp_us, repeated.frame.timestamp_us);
-                assert_eq!(output.retain.unwrap()(output.context), STATUS_OK);
-                held = Some(*output);
-                STATUS_OK
-            })
-        },
-        ProcessingOutcome::Accepted
-    );
-    let held = held.unwrap();
-    let original = read(&held);
-    assert_eq!(
-        unsafe { am_rtx_test_fill_source(session.0.as_ptr(), source.raw, 1.0, 1.0, 1.0) },
-        0
-    );
-    let mut changed = source.lease();
-    changed.frame.sequence += 1;
-    let mut changed_pixels = None;
-    assert_eq!(
-        unsafe {
-            process_gpu(api, 77, &changed, CAPTURE_FRAME_FRESH, |output| {
-                assert_ne!(output.context, held.context);
-                changed_pixels = Some(read(output));
-                STATUS_OK
-            })
-        },
-        ProcessingOutcome::Accepted
-    );
-    let changed_pixels = changed_pixels.unwrap();
-    assert_ne!(changed_pixels, original);
-    assert_eq!(read(&held), original);
-
-    controls["rtx_hdr_enable"] = false.into();
-    assert_eq!(
-        unsafe { update_gpu_stream(api, 77, &serde_json::to_vec(&controls).unwrap()) },
-        Ok(())
-    );
-    let mut fallback = None;
-    assert_eq!(
-        unsafe {
-            process_gpu(api, 77, &changed, CAPTURE_FRAME_CACHED_REUSE, |output| {
-                fallback = Some(read(output));
-                STATUS_OK
-            })
-        },
-        ProcessingOutcome::Accepted
-    );
-    assert_ne!(fallback.unwrap(), changed_pixels);
-    unsafe {
-        held.release.unwrap()(held.context, -1);
-        (api.cancel_dmabuf_leases)(api.base.context, 77);
-        api.base.release.unwrap()(api.base.context);
-    }
-}
-
-#[test]
-#[ignore = "requires an NVIDIA RTX GPU and AMATERASU_TRUEHDR_RUNTIME"]
-fn nvidia_cached_frame_with_one_slot_preserves_in_flight_output() {
-    let mut config = settings();
-    config.runtime_directory = std::env::var_os("AMATERASU_TRUEHDR_RUNTIME")
-        .expect("runtime path")
-        .into();
-    config.output_buffers = 1;
-    let stream = Stream::open(&config, 512, 288, None).unwrap();
-    let source = Source::new(stream.slots[0].session.clone());
-    let mut processor = Processor::new(config);
-    processor.streams.insert(77, stream);
-    let raw = into_gpu_binding(processor);
-    let api = unsafe { &*raw };
-    let initial = source.lease();
-    let mut held = None;
-    assert_eq!(
-        unsafe {
-            process_gpu(api, 77, &initial, CAPTURE_FRAME_FRESH, |output| {
-                assert_eq!(output.retain.unwrap()(output.context), STATUS_OK);
-                held = Some(*output);
-                STATUS_OK
-            })
-        },
-        ProcessingOutcome::Accepted
-    );
-    let held = held.unwrap();
-    assert_eq!(
-        unsafe {
-            process_gpu(api, 77, &initial, CAPTURE_FRAME_CACHED_REUSE, |output| {
-                assert_eq!(output.context, held.context);
-                STATUS_OK
-            })
-        },
-        ProcessingOutcome::Accepted
-    );
-    let mut changed = initial;
-    changed.frame.sequence += 1;
-    assert_eq!(
-        unsafe { process_gpu(api, 77, &changed, CAPTURE_FRAME_FRESH, |_| STATUS_OK) },
-        ProcessingOutcome::Busy
-    );
-    unsafe { held.release.unwrap()(held.context, -1) };
-    assert_eq!(
-        unsafe { process_gpu(api, 77, &changed, CAPTURE_FRAME_FRESH, |_| STATUS_OK) },
-        ProcessingOutcome::Accepted
-    );
-    unsafe {
-        (api.cancel_dmabuf_leases)(api.base.context, 77);
-        api.base.release.unwrap()(api.base.context);
-    }
-}
-
-#[test]
-#[ignore = "requires an NVIDIA RTX GPU and AMATERASU_TRUEHDR_RUNTIME pointing to the licensed VFX runtime"]
-fn nvidia_interop_orders_distinct_frames_without_intermediate_readback() {
-    let mut config = settings();
-    config.runtime_directory = std::env::var_os("AMATERASU_TRUEHDR_RUNTIME")
-        .expect("runtime path")
-        .into();
-    config.output_buffers = 2;
-    let stream = Stream::open(&config, 512, 288, None).unwrap();
-    let session = stream.slots[0].session.clone();
-    let pattern = Source::new(session.clone());
-    let white = Source::new(session.clone());
-    assert_eq!(
-        unsafe { am_rtx_test_fill_source(session.0.as_ptr(), white.raw, 1.0, 1.0, 1.0) },
-        0
-    );
-    let mut processor = Processor::new(config);
-    processor.streams.insert(77, stream);
-    let raw = into_gpu_binding(processor);
-    let api = unsafe { &*raw };
-    let native_fence = unsafe { am_rtx_test_native_fence_available(session.0.as_ptr()) } != 0;
-    eprintln!("RTX HDR native completion fence available: {native_fence}");
-    for round in 0..16 {
-        if round == 8 {
-            // Also qualify the existing GL completion fallback on this GPU.
-            unsafe { am_rtx_test_disable_native_fence(session.0.as_ptr()) };
-        }
-        let mut outputs = Vec::new();
-        for source in [&pattern, &white] {
-            assert_eq!(
-                unsafe {
-                    process_gpu(api, 77, &source.lease(), CAPTURE_FRAME_FRESH, |output| {
-                        assert_eq!(output.retain.unwrap()(output.context), STATUS_OK);
-                        outputs.push(*output);
-                        STATUS_OK
-                    })
-                },
-                ProcessingOutcome::Accepted
-            );
-        }
-        // The pattern's right-hand side is black. The second source is white.
-        // Read only after both conversions, exercising interop ordering across
-        // resource reuse as well as immutable output ownership.
-        let first = read(&outputs[0]);
-        let second = read(&outputs[1]);
-        assert!(nits(first[511] & 1023) < 0.01);
-        assert!(nits(second[511] & 1023) > 400.0);
-        for output in outputs {
-            unsafe { output.release.unwrap()(output.context, -1) };
-        }
-    }
-    unsafe {
-        (api.cancel_dmabuf_leases)(api.base.context, 77);
-        api.base.release.unwrap()(api.base.context);
-    }
-}
-
-#[test]
-#[ignore = "requires an NVIDIA RTX GPU and AMATERASU_TRUEHDR_RUNTIME pointing to the licensed VFX runtime"]
-fn nvidia_sdk_toggle_from_disabled_preserves_frames_and_hdr_output() {
-    for scope in ["global", "application"] {
-        verify_gpu_toggle(scope, None);
-    }
-}
-
-#[test]
-#[ignore = "requires an NVIDIA RTX GPU and AMATERASU_TRUEHDR_RUNTIME pointing to the licensed VFX runtime"]
-fn nvidia_ten_bit_sdr_application_converts_and_preserves_held_frames() {
-    for format in [*b"AR30", *b"AB30"] {
-        verify_gpu_toggle("application", Some(u32::from_le_bytes(format)));
-    }
-}
-
-fn verify_gpu_toggle(scope: &str, format: Option<u32>) {
-    let mut config = settings();
-    config.runtime_directory = std::env::var_os("AMATERASU_TRUEHDR_RUNTIME")
-        .expect("runtime path")
-        .into();
-    config.output_buffers = 2;
-    let stream = Stream::open(&config, 512, 288, None).unwrap();
-    let source = Source::new_format(stream.slots[0].session.clone(), format);
-    let mut processor = Processor::new(config);
-    let (mut controls, _) = intent_settings();
-    controls["rtx_hdr_enable"] = false.into();
-    controls["rtx_hdr_scope"] = scope.into();
-    let enable_key = if scope == "application" {
-        "rtx_hdr_application_enable"
-    } else {
-        "rtx_hdr_enable"
-    };
-    processor
-        .configure_stream(77, &serde_json::to_vec(&controls).unwrap())
-        .unwrap();
-    let metadata = processor.hdr_metadata(77).unwrap();
-    let raw = into_gpu_binding(processor);
-    // SAFETY: this test retains the SDK-owned binding and its input source until
-    // all output references have been released and cancellation has completed.
-    let api = unsafe { &*raw };
-    let input = source.lease();
-    let mut held = None;
-    let mut fallback = Vec::new();
-    assert_eq!(
-        unsafe {
-            process_gpu(api, 77, &input, CAPTURE_FRAME_FRESH, |output| {
-                assert_eq!(output.frame.color, DMABUF_COLOR_BT2020_PQ);
-                fallback = read(output);
-                assert_eq!(output.retain.unwrap()(output.context), STATUS_OK);
-                held = Some(*output);
-                STATUS_OK
-            })
-        },
-        ProcessingOutcome::Accepted
-    );
-    let held = held.unwrap();
-    assert!((nits(fallback[300] & 1023) - 100.0).abs() < 3.0);
-    let mut converted = None;
-    for enabled in [true, false, true, false] {
-        controls[enable_key] = enabled.into();
-        assert_eq!(
-            unsafe { update_gpu_stream(api, 77, &serde_json::to_vec(&controls).unwrap()) },
-            Ok(())
-        );
-        let mut pixels = Vec::new();
-        assert_eq!(
-            unsafe {
-                process_gpu(api, 77, &input, CAPTURE_FRAME_FRESH, |output| {
-                    assert_eq!(output.frame.color, held.frame.color);
-                    assert_eq!(output.frame.fourcc, held.frame.fourcc);
-                    assert_eq!(output.frame.sequence, input.frame.sequence);
-                    pixels = read(output);
-                    STATUS_OK
-                })
-            },
-            ProcessingOutcome::Accepted
-        );
-        let white = nits(pixels[300] & 1023);
-        if enabled {
-            assert!(white > 900.0, "conversion white: {white}");
-            if let Some(expected) = &converted {
-                assert_eq!(&pixels, expected, "conversion changed on repeated enable");
+#[ignore = "requires NVIDIA RTX and AMATERASU_TRUEHDR_RUNTIME; run only with the stream idle"]
+fn nvidia_cpu_bgra_nv12_and_ten_bit_sdr_produce_cuda_hdr_and_retire_source_references() {
+    use amaterasu_module_sdk::capture::{CpuFrameLeasePool, CpuSourcePresentation};
+    use std::sync::Arc;
+    for (format, id) in [(PIXEL_BGRA8, 9), (PIXEL_NV12, 11), (PIXEL_P010, 13)] {
+        let config = gpu_settings();
+        let fixture = Stream::open(&config, 256, 144, None).unwrap();
+        let binding = Binding::new(config);
+        let inputs = input::InputOffers::new();
+        let (_, offers) = inputs.enumerate();
+        let mut offer = offers.into_iter().find(|o| o.id == id).unwrap();
+        offer.id = 1;
+        binding.negotiate(&offer);
+        let caps = unsafe { *offer.resource.data.cast::<CpuResourceCapabilitiesV2>() };
+        let stride = 256
+            * if format == PIXEL_BGRA8 {
+                4
+            } else if format == PIXEL_P010 {
+                2
             } else {
-                converted = Some(pixels);
+                1
+            };
+        let rows = if format == PIXEL_BGRA8 { 144 } else { 216 };
+        let mut bytes = vec![128; stride as usize * rows];
+        if format == PIXEL_P010 {
+            for pixel in bytes.as_chunks_mut::<2>().0 {
+                pixel.copy_from_slice(&(512u16 << 6).to_le_bytes());
             }
-        } else {
-            assert_eq!(pixels, fallback);
         }
-        assert_eq!(read(&held), fallback, "toggle changed a retained frame");
-        let mut observed = metadata;
-        let v1_1 = unsafe { &*raw.cast::<amaterasu_media::GpuProcessorApiV1_1>() };
-        assert_eq!(
-            unsafe { (v1_1.hdr_metadata)(api.base.context, 77, &mut observed) },
-            STATUS_OK
-        );
-        assert_eq!(observed.fields, metadata.fields);
-        assert_eq!(observed.enabled, metadata.enabled);
-    }
-    unsafe {
-        held.release.unwrap()(held.context, -1);
-        (api.cancel_dmabuf_leases)(api.base.context, 77);
-        api.base.release.unwrap()(api.base.context);
-    }
-}
-
-#[test]
-#[ignore = "requires an NVIDIA RTX GPU and AMATERASU_TRUEHDR_RUNTIME pointing to the licensed VFX runtime"]
-fn nvidia_live_tuning_preserves_held_frames_and_calibrates_fallback() {
-    let mut config = settings();
-    config.runtime_directory = std::env::var_os("AMATERASU_TRUEHDR_RUNTIME")
-        .expect("runtime path")
-        .into();
-    config.output_buffers = 2;
-    config.peak_luminance = 1000;
-    let stream = Stream::open(&config, 512, 288, None).unwrap();
-    let session = stream.slots[0].session.clone();
-    let source = Source::new(session.clone());
-    let mut processor = Processor::new(config.clone());
-    let (initial_controls, _) = intent_settings();
-    processor
-        .configure_stream(77, &serde_json::to_vec(&initial_controls).unwrap())
-        .unwrap();
-    processor.streams.insert(77, stream);
-    let raw = into_gpu_binding(processor);
-    let api = unsafe { &*raw };
-    let input = source.lease();
-    let mut held = None;
-    let mut initial = Vec::new();
-    assert_eq!(
-        unsafe {
-            process_gpu(api, 77, &input, CAPTURE_FRAME_FRESH, |output| {
-                initial = read(output);
-                assert_eq!(output.retain.unwrap()(output.context), STATUS_OK);
-                held = Some(*output);
-                STATUS_OK
-            })
-        },
-        ProcessingOutcome::Accepted
-    );
-    let held = held.unwrap();
-    let mut vendor = vec![0; initial.len()];
-    assert_eq!(
-        unsafe { am_rtx_test_read_vendor(session.0.as_ptr(), vendor.as_mut_ptr(), vendor.len()) },
-        0
-    );
-    assert!(
-        initial
-            .iter()
-            .zip(&vendor)
-            .all(|(a, b)| a & 0x3fff_ffff == b & 0x3fff_ffff)
-    );
-
-    config.peak_luminance = 2000;
-    let live = br#"{"rtx_hdr_enable":true,"rtx_hdr_peak_brightness":2000,"rtx_hdr_middle_gray":50,"rtx_hdr_contrast":0,"rtx_hdr_saturation":0,"rtx_hdr_debanding":true}"#;
-    assert_eq!(unsafe { update_gpu_stream(api, 77, live) }, Ok(()));
-    let mut peak = Vec::new();
-    assert_eq!(
-        unsafe {
-            process_gpu(api, 77, &input, CAPTURE_FRAME_FRESH, |output| {
-                peak = read(output);
-                STATUS_OK
-            })
-        },
-        ProcessingOutcome::Accepted
-    );
-    assert_eq!(
-        read(&held),
-        initial,
-        "reconfiguration must preserve leased pixels"
-    );
-    let highlight = nits(peak[300] & 1023);
-    eprintln!(
-        "2000-nit setting: white={highlight:.1} nits; baseline={:.1} nits",
-        nits(initial[300] & 1023)
-    );
-    assert!(
-        (highlight / 2000.0 - 1.0).abs() < 0.08,
-        "peak calibration did not reach target"
-    );
-    assert!(
-        nits(peak[511] & 1023) < 0.01,
-        "calibration must preserve black"
-    );
-    for requested_peak in [1200, 1600, 2000] {
-        for requested_gray in [10, 50] {
-            config.peak_luminance = requested_peak;
-            config.middle_gray = requested_gray;
-            Stream::configure_session(&session, &config, true, None).unwrap();
-            let mut sample = Vec::new();
-            assert_eq!(
-                unsafe {
-                    process_gpu(api, 77, &input, CAPTURE_FRAME_FRESH, |output| {
-                        sample = read(output);
-                        STATUS_OK
-                    })
+        let pool = CpuFrameLeasePool::default();
+        let lease = pool
+            .lease(
+                CpuSourcePresentation {
+                    receipt: None,
+                    width: 256,
+                    height: 144,
+                    stride,
+                    pixel_format: format,
+                    color: caps.color,
+                    bytes: Arc::new(bytes).into(),
+                    timestamp_us: 66,
+                    capture_pacing_timestamp_us: 99,
+                    sequence: 1,
+                    freshness: CAPTURE_FRAME_FRESH,
                 },
-                ProcessingOutcome::Accepted
-            );
-            let white = nits(sample[300] & 1023);
-            eprintln!("peak={requested_peak}, gray={requested_gray}: white={white:.1} nits");
-            assert!((white / f64::from(requested_peak) - 1.0).abs() < 0.08);
-            assert!(
-                sample
-                    .iter()
-                    .all(|p| [0, 10, 20].iter().all(|shift| (p >> shift) & 1023 <= 846))
-            );
-            assert!(nits(sample[511] & 1023) < 0.01);
-        }
-    }
-    let rejected = br#"{"rtx_hdr_enable":true,"rtx_hdr_peak_brightness":2001,"rtx_hdr_middle_gray":50,"rtx_hdr_contrast":0,"rtx_hdr_saturation":0,"rtx_hdr_debanding":true}"#;
-    assert_eq!(
-        unsafe { update_gpu_stream(api, 77, rejected) },
-        Err(STATUS_INVALID_ARGUMENT)
-    );
-    let invalid = [201u32, 100, 50, 1000, 0];
-    let mut error = [0; 512];
-    assert_ne!(
-        unsafe {
-            am_rtx_configure(
-                session.0.as_ptr(),
-                invalid.as_ptr(),
-                false,
-                0,
-                error.as_mut_ptr(),
-                error.len(),
+                1,
+                1,
             )
-        },
-        0
-    );
-    let mut after_rejection = Vec::new();
-    assert_eq!(
-        unsafe {
-            process_gpu(api, 77, &input, CAPTURE_FRAME_FRESH, |output| {
-                after_rejection = read(output);
-                STATUS_OK
-            })
-        },
-        ProcessingOutcome::Accepted
-    );
-    assert!(
-        nits(after_rejection[300] & 1023) > 1900.0,
-        "rejected update changed the active conversion"
-    );
-    config.peak_luminance = 1000;
-    for control in ["contrast", "saturation", "middle_gray", "debanding"] {
-        let mut changed = config.clone();
-        match control {
-            "contrast" => changed.contrast = 0,
-            "saturation" => changed.saturation = 0,
-            "middle_gray" => changed.middle_gray = 10,
-            "debanding" => changed.debanding = false,
-            _ => unreachable!(),
-        }
-        Stream::configure_session(&session, &changed, true, None).unwrap();
-        let mut sample = Vec::new();
-        assert_eq!(
-            unsafe {
-                process_gpu(api, 77, &input, CAPTURE_FRAME_FRESH, |output| {
-                    sample = read(output);
-                    STATUS_OK
-                })
-            },
-            ProcessingOutcome::Accepted
-        );
-        if control != "debanding" {
-            assert_ne!(sample, initial, "live {control} must alter sampled pixels");
-        }
-    }
-    Stream::configure_session(&session, &config, false, None).unwrap();
-    let mut fallback_100 = Vec::new();
-    assert_eq!(
-        unsafe {
-            process_gpu(api, 77, &input, CAPTURE_FRAME_FRESH, |output| {
-                fallback_100 = read(output);
-                STATUS_OK
-            })
-        },
-        ProcessingOutcome::Accepted
-    );
-    config.sdr_brightness = 100;
-    Stream::configure_session(&session, &config, false, None).unwrap();
-    let mut fallback_200 = Vec::new();
-    assert_eq!(
-        unsafe {
-            process_gpu(api, 77, &input, CAPTURE_FRAME_FRESH, |output| {
-                fallback_200 = read(output);
-                STATUS_OK
-            })
-        },
-        ProcessingOutcome::Accepted
-    );
-    assert!((nits(fallback_100[300] & 1023) - 100.0).abs() < 3.0);
-    assert!((nits(fallback_200[300] & 1023) - 200.0).abs() < 5.0);
-    assert_eq!(read(&held), initial);
-    unsafe {
-        held.release.unwrap()(held.context, -1);
-        (api.cancel_dmabuf_leases)(api.base.context, 77);
-        api.base.release.unwrap()(api.base.context);
-    }
-}
-
-#[test]
-#[ignore = "requires an NVIDIA RTX GPU and AMATERASU_TRUEHDR_RUNTIME pointing to the licensed VFX runtime"]
-fn nvidia_gpu_processes_real_pixels_and_preserves_bounded_ownership() {
-    let mut config = settings();
-    config.runtime_directory = std::env::var_os("AMATERASU_TRUEHDR_RUNTIME")
-        .expect("runtime path")
-        .into();
-    config.output_buffers = 1;
-    let stream = Stream::open(&config, 512, 288, None).unwrap();
-    let source = Source::new(stream.slots[0].session.clone());
-    let mut processor = Processor::new(config.clone());
-    processor.streams.insert(77, stream);
-    let raw = into_gpu_binding(processor);
-    let api = unsafe { &*raw };
-    let input = source.lease();
-    let mut held = None;
-    let mut first = Vec::new();
-    let outcome = unsafe {
-        process_gpu(api, 77, &input, CAPTURE_FRAME_FRESH, |output| {
-            assert_eq!(output.frame.color, DMABUF_COLOR_BT2020_PQ);
-            assert_eq!(output.frame.fourcc, u32::from_le_bytes(*b"AB30"));
-            first = read(output);
-            assert_eq!(output.retain.unwrap()(output.context), STATUS_OK);
-            held = Some(*output);
-            STATUS_OK
-        })
-    };
-    assert_eq!(outcome, ProcessingOutcome::Accepted);
-    assert_eq!(
-        unsafe {
-            process_gpu(api, 77, &input, CAPTURE_FRAME_FRESH, |_| {
-                panic!("pool must be full")
-            })
-        },
-        ProcessingOutcome::Busy
-    );
-    let held = held.take().unwrap();
-    let completion = unsafe { am_rtx_test_fence(source.session.0.as_ptr()) };
-    assert!(completion >= 0);
-    unsafe {
-        held.release.unwrap()(held.context, completion);
-    }
-    assert_eq!(
-        unsafe { libc::fcntl(completion, libc::F_GETFD) },
-        -1,
-        "release owns and closes completion fd"
-    );
-    let mut repeated = Vec::new();
-    assert_eq!(
-        unsafe {
-            process_gpu(api, 77, &input, CAPTURE_FRAME_CACHED_REUSE, |output| {
-                repeated = read(output);
-                STATUS_OK
-            })
-        },
-        ProcessingOutcome::Accepted
-    );
-    assert!(
-        first == repeated,
-        "same pixels/settings must be deterministic: first={:#x}, repeated={:#x}, changed={}",
-        first[0],
-        repeated[0],
-        first.iter().zip(&repeated).filter(|(a, b)| a != b).count()
-    );
-    let bright = first[0];
-    let black = first[511];
-    assert_ne!(
-        bright & 0x3fff_ffff,
-        black & 0x3fff_ffff,
-        "actual HDR pixels must change with source content"
-    );
-    assert!(
-        bright & 1023 > (bright >> 20) & 1023,
-        "warm input must retain red over blue"
-    );
-    unsafe {
-        (api.cancel_dmabuf_leases)(api.base.context, 77);
-    }
-    assert_eq!(
-        unsafe {
-            process_gpu(api, 77, &input, CAPTURE_FRAME_FRESH, |_| {
-                panic!("cancelled")
-            })
-        },
-        ProcessingOutcome::Failed(MEDIA_CLOSED)
-    );
-    unsafe {
-        api.base.release.unwrap()(api.base.context);
-    }
-
-    let raw = into_gpu_binding(Processor::new(config));
-    let api = unsafe { &*raw };
-    let stream_settings = br#"{"rtx_hdr_enable":true,"rtx_hdr_peak_brightness":650,"rtx_hdr_middle_gray":50,"rtx_hdr_contrast":0,"rtx_hdr_saturation":-100,"rtx_hdr_debanding":true}"#;
-    unsafe { configure_gpu_stream(api, 88, stream_settings) }.unwrap();
-    let mut changed = Vec::new();
-    assert_eq!(
-        unsafe {
-            process_gpu(api, 88, &input, CAPTURE_FRAME_FRESH, |output| {
-                changed = read(output);
-                STATUS_OK
-            })
-        },
-        ProcessingOutcome::Accepted
-    );
-    assert!(
-        first != changed,
-        "vendor saturation control must alter numeric HDR output"
-    );
-    eprintln!(
-        "TrueHDR numeric sample: warm={bright:#010x}, black={black:#010x}, saturation0={:#010x}",
-        changed[0]
-    );
-    unsafe {
-        (api.cancel_dmabuf_leases)(api.base.context, 88);
-        api.base.release.unwrap()(api.base.context);
-    }
-}
-
-#[test]
-#[ignore = "requires an NVIDIA RTX GPU and AMATERASU_TRUEHDR_RUNTIME"]
-fn nvidia_conversion_stays_queued_with_fenced_output_and_retained_input() {
-    let mut config = settings();
-    config.runtime_directory = std::env::var_os("AMATERASU_TRUEHDR_RUNTIME")
-        .expect("runtime path")
-        .into();
-    let stream = Stream::open(&config, 512, 288, None).unwrap();
-    let session = stream.slots[0].session.clone();
-    assert_eq!(
-        unsafe { am_rtx_test_native_fence_available(session.0.as_ptr()) },
-        1,
-        "the asynchronous handoff requires native fences"
-    );
-    let input = CountingInput {
-        source: Source::new(session.clone()),
-        references: Cell::new(0),
-        fenced_releases: Cell::new(0),
-    };
-    let mut processor = Processor::new(config);
-    processor.streams.insert(77, stream);
-    let raw = into_gpu_binding(processor);
-    let api = unsafe { &*raw };
-    let mut baseline = None;
-    for sequence in 1..=6 {
-        let mut lease = input.lease();
-        lease.frame.sequence = sequence;
-        let result = unsafe {
-            process_gpu(api, 77, &lease, CAPTURE_FRAME_FRESH, |output| {
-                // The output is lent before the GPU finishes; its acquire
-                // fence, not a CPU barrier, orders the consumer's reads.
-                let fence = output.frame.planes[0].acquire_fence_fd;
-                assert!(fence >= 0, "output must carry an acquire fence");
-                assert_eq!(am_rtx_wait_fence(fence), 0);
-                let pixels = read(output);
-                match &baseline {
-                    Some(previous) => assert_eq!(&pixels, previous),
-                    None => baseline = Some(pixels),
-                }
-                STATUS_OK
-            })
-        };
-        assert_eq!(result, ProcessingOutcome::Accepted);
-        // The conversion may still read the input, so the processor keeps an
-        // independent reference within its bounded retirement queue.
-        let held = input.references.get();
+            .unwrap();
+        let output = binding.process(lease.descriptor()).unwrap();
+        drop(lease);
+        assert_eq!(pool.retirement_ready(), Ok(false));
         assert!(
-            (1..=MAX_PENDING_INPUTS as i32).contains(&held),
-            "input references after frame {sequence}: {held}"
+            read(&fixture.session, &output)
+                .iter()
+                .any(|p| p & 0x3fff_ffff != 0)
         );
-    }
-    unsafe { (api.cancel_dmabuf_leases)(api.base.context, 77) };
-    assert_eq!(input.references.get(), 0, "cancel retires every input");
-    assert!(
-        input.fenced_releases.get() >= 1,
-        "inputs released with fences"
-    );
-    unsafe { api.base.release.unwrap()(api.base.context) };
-}
-
-#[test]
-#[ignore = "requires an NVIDIA RTX GPU and AMATERASU_TRUEHDR_RUNTIME"]
-fn nvidia_without_native_fences_completes_before_returning() {
-    let mut config = settings();
-    config.runtime_directory = std::env::var_os("AMATERASU_TRUEHDR_RUNTIME")
-        .expect("runtime path")
-        .into();
-    let stream = Stream::open(&config, 512, 288, None).unwrap();
-    let session = stream.slots[0].session.clone();
-    let input = CountingInput {
-        source: Source::new(session.clone()),
-        references: Cell::new(0),
-        fenced_releases: Cell::new(0),
-    };
-    unsafe { am_rtx_test_disable_native_fence(session.0.as_ptr()) };
-    let mut processor = Processor::new(config);
-    processor.streams.insert(77, stream);
-    let raw = into_gpu_binding(processor);
-    let api = unsafe { &*raw };
-    let result = unsafe {
-        process_gpu(api, 77, &input.lease(), CAPTURE_FRAME_FRESH, |output| {
-            assert_eq!(output.frame.planes[0].acquire_fence_fd, -1);
-            STATUS_OK
-        })
-    };
-    assert_eq!(result, ProcessingOutcome::Accepted);
-    assert_eq!(
-        input.references.get(),
-        0,
-        "synchronous completion releases input"
-    );
-    assert_eq!(input.fenced_releases.get(), 0);
-    unsafe {
-        (api.cancel_dmabuf_leases)(api.base.context, 77);
-        api.base.release.unwrap()(api.base.context);
+        unsafe { release(output) };
+        drop(binding);
+        assert_eq!(pool.retirement_ready(), Ok(true));
     }
 }
 
 #[test]
-#[ignore = "requires an NVIDIA RTX GPU and AMATERASU_TRUEHDR_RUNTIME"]
-fn nvidia_reports_gpu_stage_timing_without_waiting() {
-    let mut config = settings();
-    config.runtime_directory = std::env::var_os("AMATERASU_TRUEHDR_RUNTIME")
-        .expect("runtime path")
-        .into();
-    let width = std::env::var("AMATERASU_RTX_BENCH_WIDTH")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(512);
-    let height = std::env::var("AMATERASU_RTX_BENCH_HEIGHT")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(288);
-    let stream = Stream::open(&config, width, height, None).unwrap();
-    let session = stream.slots[0].session.clone();
-    eprintln!("RTX HDR context priority: {:#x}", unsafe {
-        am_rtx_context_priority(session.0.as_ptr())
-    });
-    let source = Source::new(session.clone());
-    let mut processor = Processor::new(config);
-    processor.streams.insert(77, stream);
-    let raw = into_gpu_binding(processor);
-    let api = unsafe { &*raw };
-    for sequence in 1..=60 {
-        let mut lease = source.lease();
-        lease.frame.sequence = sequence;
-        let result = unsafe {
-            process_gpu(api, 77, &lease, CAPTURE_FRAME_FRESH, |output| {
-                // Paced like a stream: consume each output before the next.
-                let fence = output.frame.planes[0].acquire_fence_fd;
-                assert_eq!(am_rtx_wait_fence(fence), 0);
-                STATUS_OK
-            })
-        };
-        assert_eq!(result, ProcessingOutcome::Accepted);
-        std::thread::sleep(std::time::Duration::from_millis(8));
-    }
-    let mut timing = GpuTiming::default();
-    unsafe { am_rtx_take_timing(session.0.as_ptr(), &mut timing) };
-    eprintln!(
-        "RTX HDR GPU timing {width}x{height}: {}",
-        serde_json::to_string(&timing).unwrap()
-    );
-    assert!(
-        timing.samples >= 50,
-        "timed {} of 60 frames",
-        timing.samples
-    );
-    assert!(timing.model_run_us > 0, "CUDA model execution is timed");
-    assert!(timing.total_us >= timing.sample_us + timing.output_us);
-    drop(source);
-    drop(session);
-    unsafe {
-        (api.cancel_dmabuf_leases)(api.base.context, 77);
-        api.base.release.unwrap()(api.base.context);
-    }
-}
-
-unsafe extern "C" fn collect_offer(
-    context: *mut c_void,
-    offer: *const CaptureResourceOffer,
-) -> Status {
-    let offers = unsafe { &mut *context.cast::<Vec<(u64, u32)>>() };
-    let offer = unsafe { &*offer };
-    offers.push((offer.id, offer.resource.kind));
-    STATUS_OK
-}
-
-/// Retains the delivered resource frame so the test can read it after return.
-unsafe extern "C" fn hold_resource(
-    context: *mut c_void,
-    frame: *const CaptureResourceFrame,
-) -> Status {
-    let held = unsafe { &mut *context.cast::<Option<CaptureResourceFrame>>() };
-    let frame = unsafe { &*frame };
-    assert_eq!(unsafe { (frame.retain)(frame.context) }, STATUS_OK);
-    *held = Some(*frame);
-    STATUS_OK
-}
-
-fn release_resource(frame: &CaptureResourceFrame) {
-    let none = FrameDescriptor {
-        kind: FRAME_SYNC_NONE,
-        version: 0,
-        size: 0,
-        reserved: 0,
-        namespace: [0; 16],
-        data: std::ptr::null(),
-    };
-    unsafe { (frame.release)(frame.context, &none) };
-}
-
-/// Largest per-channel difference between two packed X2B10G10R10 images.
-fn largest_channel_difference(left: &[u32], right: &[u32]) -> u32 {
-    left.iter()
-        .zip(right)
-        .flat_map(|(a, b)| {
-            (0..3).map(move |channel| {
-                let shift = channel * 10;
-                ((a >> shift) & 1023).abs_diff((b >> shift) & 1023)
-            })
-        })
-        .max()
-        .unwrap_or(0)
-}
-
-#[test]
-#[ignore = "requires an NVIDIA RTX GPU and AMATERASU_TRUEHDR_RUNTIME"]
-fn nvidia_cuda_output_matches_the_gl_output() {
-    use amaterasu_module_sdk::processing::resource_output_table;
-    let mut config = settings();
-    config.runtime_directory = std::env::var_os("AMATERASU_TRUEHDR_RUNTIME")
-        .expect("runtime path")
-        .into();
-    let stream = Stream::open(&config, 512, 288, None).unwrap();
-    let session = stream.slots[0].session.clone();
-    let source = Source::new(session.clone());
-    let mut processor = Processor::new(config.clone());
-    let (controls, _) = intent_settings();
-    processor
-        .configure_stream(77, &serde_json::to_vec(&controls).unwrap())
+#[ignore = "requires NVIDIA RTX and AMATERASU_TRUEHDR_RUNTIME; run only with the stream idle"]
+fn nvidia_cached_output_is_invalidated_by_updates_without_mutating_other_readers() {
+    let mut config = gpu_settings();
+    config.output_buffers = 2;
+    let fixture = Stream::open(&config, 512, 288, None).unwrap();
+    let source = Source::new(fixture.session.clone(), u32::from_le_bytes(*b"AB24"));
+    let binding = Binding::new(config);
+    let (caps, mut offer) = source.offer();
+    offer.resource.data = std::ptr::from_ref(&caps).cast();
+    binding.negotiate(&offer);
+    let original = binding
+        .process(&source.resource(1, CAPTURE_FRAME_FRESH))
         .unwrap();
-    processor.streams.insert(77, stream);
-    let raw = into_gpu_binding(processor);
-    let api = unsafe { &*raw };
-    let table = unsafe { resource_output_table(api) }.expect("v1.4 resource output tail");
-    let mut offers = Vec::new();
-    let mut generation = 0;
-    let status = unsafe {
-        (table.enumerate_outputs)(
-            api.base.context,
-            77,
-            CaptureResourceOfferSink {
-                context: (&mut offers as *mut Vec<(u64, u32)>).cast(),
-                write: collect_offer,
-            },
-            &mut generation,
-        )
-    };
-    assert_eq!(status, STATUS_OK);
-    assert_eq!(offers, vec![(1u64, FRAME_RESOURCE_CUDA_DEVICE)]);
-    assert_eq!(
-        unsafe { (table.select_output)(api.base.context, 77, generation, 1) },
-        STATUS_OK
-    );
-    for (sequence, (enabled, peak)) in [(true, 1424), (true, 1000), (false, 1000)]
-        .into_iter()
-        .enumerate()
-    {
-        let mut tuned = controls.clone();
-        tuned["rtx_hdr_enable"] = enabled.into();
-        tuned["rtx_hdr_peak_brightness"] = peak.into();
-        unsafe { update_gpu_stream(api, 77, &serde_json::to_vec(&tuned).unwrap()) }.unwrap();
-        let mut lease = source.lease();
-        lease.frame.sequence = 10 + sequence as u64 * 2;
-        let mut gl = Vec::new();
-        let outcome = unsafe {
-            process_gpu(api, 77, &lease, CAPTURE_FRAME_FRESH, |output| {
-                gl = read(output);
-                STATUS_OK
-            })
-        };
-        assert_eq!(outcome, ProcessingOutcome::Accepted);
-        lease.frame.sequence += 1;
-        let mut held: Option<CaptureResourceFrame> = None;
-        let status = unsafe {
-            (table.process_to_resource)(
-                api.base.context,
-                77,
-                &lease,
-                CAPTURE_FRAME_FRESH,
-                CaptureResourceFrameSink {
-                    context: (&mut held as *mut Option<CaptureResourceFrame>).cast(),
-                    write: hold_resource,
-                },
-            )
-        };
-        assert_eq!(status, STATUS_OK);
-        let frame = held.expect("one resource frame");
-        assert_eq!(frame.sequence, lease.frame.sequence);
-        assert_eq!(frame.color.transfer, FRAME_TRANSFER_PQ);
-        let cuda = unsafe { cuda_device_frame(&frame.resource) }.expect("CUDA frame payload");
-        assert!(unsafe { cuda_event_sync(&frame.acquire_sync) }.is_some());
-        let mut pixels = vec![0u32; gl.len()];
-        assert_eq!(
-            unsafe {
-                am_rtx_test_read_cuda(
-                    session.0.as_ptr(),
-                    cuda.device_pointer,
-                    cuda.pitch,
-                    pixels.as_mut_ptr(),
-                    pixels.len(),
-                )
-            },
-            0
-        );
-        let difference = largest_channel_difference(&gl, &pixels);
-        eprintln!("enabled={enabled} peak={peak}: largest code difference {difference}");
-        // The kernels evaluate the same formulas and rounding as the shaders.
-        assert_eq!(difference, 0, "CUDA output diverges by {difference} codes");
-        release_resource(&frame);
-    }
+    let before = read(&source.session, &original);
+    let cached = binding
+        .process(&source.resource(1, CAPTURE_FRAME_CACHED_REUSE))
+        .unwrap();
+    assert_eq!(cached.resource.data, original.resource.data);
+    assert_eq!(read(&source.session, &cached), before);
+    unsafe { release(cached) };
+    let api = binding.api();
+    unsafe { update_frame_stream(api, 77, br#"{"rtx_hdr_enable":false}"#) }.unwrap();
+    let changed = binding
+        .process(&source.resource(1, CAPTURE_FRAME_CACHED_REUSE))
+        .unwrap();
+    assert_eq!(changed.color.transfer, FRAME_TRANSFER_PQ);
+    let after = read(&source.session, &changed);
+    assert_ne!(before, after);
+    assert_eq!(read(&source.session, &original), before);
+    // The disabled effect still emits the HDR stream's SDR-compatible PQ path.
+    let code = f64::from(after[300] & 1023) / 1023.0;
+    let p = code.powf(32.0 / 2523.0);
+    let nits =
+        10000.0 * ((p - 0.8359375).max(0.0) / (18.8515625 - 18.6875 * p)).powf(16384.0 / 2610.0);
+    assert!((nits - 100.0).abs() < 3.0);
+    // Stream cancellation leaves other readers valid while the binding stays
+    // loaded; release those readers before returning the native binding.
+    unsafe { (api.base.base.cancel)(api.base.base.base.context, 77) };
+    assert_eq!(retirement_ready(), Ok(false));
+    assert_eq!(read(&source.session, &original), before);
     unsafe {
-        (api.cancel_dmabuf_leases)(api.base.context, 77);
-        api.base.release.unwrap()(api.base.context);
+        release(changed);
+        release(original);
     }
+    assert_eq!(source.references.get(), 0);
+    drop(binding);
+    drop(source);
+    drop(fixture);
+    assert_eq!(retirement_ready(), Ok(true));
+}
+
+#[test]
+fn cuda_admission_limits_recover_without_waiting_or_wraparound() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    assert_eq!(resource::validate_storage_budget(3840, 2160, 2), Ok(()));
+    assert_eq!(
+        resource::validate_storage_budget(8192, 8192, 2),
+        Err(MEDIA_UNSUPPORTED)
+    );
+    let count = AtomicUsize::new(0);
+    assert_eq!(resource::reserve(&count, 64, 64), Ok(()));
+    assert_eq!(resource::reserve(&count, 1, 64), Err(MEDIA_BUSY));
+    assert_eq!(resource::reserve(&count, usize::MAX, 64), Err(MEDIA_BUSY));
+    count.fetch_sub(64, Ordering::AcqRel);
+    assert_eq!(resource::reserve(&count, 1, 64), Ok(()));
+}
+
+#[test]
+fn contended_foreground_policy_defers_without_switching_effects_or_waiting() {
+    use std::sync::{Arc, Mutex, atomic::AtomicUsize};
+    let policy = Arc::new(Mutex::new(
+        crate::foreground_policy::ForegroundPolicy::default(),
+    ));
+    let mut config = settings();
+    config.foreground_only = true;
+    let processor =
+        Processor::new(config).with_policy(policy.clone(), Arc::new(AtomicUsize::new(0)));
+    let held = policy.lock().unwrap();
+    assert_eq!(processor.conversion_enabled(1), Err(MEDIA_BUSY));
+    drop(held);
+    assert_eq!(processor.conversion_enabled(1), Ok(false));
 }

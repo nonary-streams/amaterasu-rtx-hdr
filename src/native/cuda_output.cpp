@@ -22,6 +22,8 @@ void Session::load_kernels() {
                    "resolve PQ output kernel");
         cuda_check(api->module_function(&sdr_output, kernels, "am_rtx_sdr_output"),
                    "resolve SDR output kernel");
+        cuda_check(api->module_function(&cpu_input, kernels, "am_rtx_cpu_input"),
+                   "resolve CPU input kernel");
     } catch (...) {
         api->unload_module(kernels);
         kernels = nullptr;
@@ -76,6 +78,54 @@ void Session::convert_to_cuda(CudaOutput &destination) {
     cuda_check(api->unmap(1, &input_resource, stream), "unmap effect input");
 }
 
+void Session::upload_cpu(const AmaterasuCpuFrame &frame, const AmaterasuFrameColorMetadata &color) {
+    if (!frame.data || frame.width != input.width || frame.height != input.height ||
+        frame.format < 1 || frame.format > 3)
+        throw std::runtime_error("invalid CPU input");
+    const size_t row_bytes = size_t(frame.width) * (frame.format == 1 ? 4 : frame.format == 3 ? 2 : 1);
+    const size_t rows = frame.format == 1 ? frame.height : size_t(frame.height) * 3 / 2;
+    if (frame.stride < row_bytes || frame.len != rows * frame.stride)
+        throw std::runtime_error("invalid CPU input layout");
+    load_kernels();
+    if (!upload) {
+        cuda_check(api->allocate_pitch(&upload, &upload_pitch, row_bytes, rows, 4), "allocate CPU input staging");
+        upload_rows = rows;
+    }
+    if (upload_pitch < row_bytes || upload_rows < rows || upload_pitch > UINT32_MAX)
+        throw std::runtime_error("CPU input layout changed during processing");
+    CUDA_MEMCPY2D copy{};
+    copy.srcMemoryType = CU_MEMORYTYPE_HOST;
+    copy.srcHost = frame.data;
+    copy.srcPitch = frame.stride;
+    copy.dstMemoryType = CU_MEMORYTYPE_DEVICE;
+    copy.dstDevice = upload;
+    copy.dstPitch = upload_pitch;
+    copy.WidthInBytes = row_bytes;
+    copy.Height = rows;
+    cuda_check(api->copy(&copy, stream), "upload CPU frame");
+    void *target = input.pixels;
+    unsigned src_pitch = static_cast<unsigned>(upload_pitch), dst_pitch = static_cast<unsigned>(input.pitch);
+    int width = static_cast<int>(frame.width), height = static_cast<int>(frame.height);
+    unsigned format = frame.format, transfer = color.transfer, range = color.range;
+    void *arguments[] = {&upload, &src_pitch, &target, &dst_pitch, &width, &height, &format, &transfer, &range};
+    cuda_check(api->launch(cpu_input, blocks(frame.width), blocks(frame.height), 1, block_size,
+        block_size, 1, 0, stream, arguments, nullptr), "convert CPU input");
+}
+
+void Session::run_cpu_cuda(const AmaterasuCpuFrame &frame, const AmaterasuFrameColorMetadata &color,
+    CudaOutput &destination) {
+    timing.begin(*api);
+    timing.started();
+    timing.sampled();
+    timing.model_queued(*api, stream, true);
+    upload_cpu(frame, color);
+    if (enabled) vfx_check(api->run_effect(effect, 1), "run TrueHDR");
+    write_output(destination);
+    cuda_check(api->record_event(destination.ready, stream), "record CPU output ready");
+    timing.model_queued(*api, stream, false);
+    timing.finished();
+}
+
 int Session::run_cuda(const AmaterasuDmaBufFrame &frame, CudaOutput &destination) {
     timing.begin(*api);
     surface.wait_acquire(frame.planes[0].acquire_fence_fd);
@@ -94,7 +144,6 @@ int Session::run_cuda(const AmaterasuDmaBufFrame &frame, CudaOutput &destination
         throw;
     }
     timing.model_queued(*api, stream, false);
-    timing.resumed();
     timing.finished();
     return input_read;
 }
@@ -188,6 +237,7 @@ extern "C" int am_rtx_process_cuda(void *context, const AmaterasuDmaBufFrame *fr
             if (session.api->synchronize_context() != CUDA_SUCCESS)
                 std::abort();
             glFinish();
+            if (glGetError()!=GL_NO_ERROR) std::abort();
             throw;
         }
         return 0;
@@ -195,4 +245,26 @@ extern "C" int am_rtx_process_cuda(void *context, const AmaterasuDmaBufFrame *fr
         report(error, capacity, failure);
         return -1;
     }
+}
+
+extern "C" int am_rtx_process_cpu_cuda(void *context, const AmaterasuCpuFrame *frame,
+    const AmaterasuFrameColorMetadata *color, void *output, char *error, size_t capacity) {
+    auto &session = *static_cast<rtx::Session *>(context);
+    try {
+        rtx::Current current(*session.api, session.surface, session.context);
+        try { session.run_cpu_cuda(*frame, *color, *static_cast<rtx::CudaOutput *>(output)); }
+        catch (...) {
+            if (session.api->synchronize_context() != CUDA_SUCCESS) std::abort();
+            throw;
+        }
+        return 0;
+    } catch (const std::exception &failure) { report(error, capacity, failure); return -1; }
+}
+extern "C" int am_rtx_cuda_output_ready(void *context, void *output) {
+    auto &session = *static_cast<rtx::Session *>(context);
+    try {
+        rtx::Current current(*session.api, session.surface, session.context);
+        const CUresult result = session.api->query_event(static_cast<rtx::CudaOutput *>(output)->ready);
+        return result == CUDA_SUCCESS ? 1 : result == CUDA_ERROR_NOT_READY ? 0 : -1;
+    } catch (...) { return -1; }
 }

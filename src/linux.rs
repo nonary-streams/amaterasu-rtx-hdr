@@ -6,24 +6,25 @@ use crate::Settings;
 use amaterasu_media::*;
 use amaterasu_module_sdk::{
     abi::*,
-    processing::{
-        GpuFrame, GpuFrameProcessor, GpuOutputFrame, ResourceOutputFrame, RetainedGpuInput,
+    frame_processing::{
+        FrameProcessor, ProcessingFrame, ResourceOutputFrame, RetainedProcessingInput,
     },
 };
 use std::os::unix::ffi::OsStrExt;
 use std::{
-    cell::{Cell, RefCell},
     collections::{BTreeMap, BTreeSet, VecDeque},
     ffi::{CStr, CString, c_char, c_void},
-    os::fd::{AsRawFd, FromRawFd, OwnedFd},
+    os::fd::{AsRawFd, OwnedFd},
     ptr::NonNull,
     rc::Rc,
+    sync::atomic::{AtomicUsize, Ordering},
 };
 
 /// Converted inputs still awaiting their GPU reads. Normally the oldest has
 /// already signalled when the next frame arrives; past this bound the
-/// provider's release waits for it, so storage pinning stays bounded.
+/// next call returns BUSY until a read retires; no input wait is introduced.
 const MAX_PENDING_INPUTS: usize = 2;
+static NATIVE_SESSIONS: AtomicUsize = AtomicUsize::new(0);
 
 unsafe extern "C" {
     fn am_rtx_open(
@@ -44,22 +45,7 @@ unsafe extern "C" {
         error: *mut c_char,
         capacity: usize,
     ) -> i32;
-    fn am_rtx_output_open(
-        context: *mut c_void,
-        frame: *mut DmaBufFrame,
-        error: *mut c_char,
-        capacity: usize,
-    ) -> *mut c_void;
-    fn am_rtx_output_close(context: *mut c_void, output: *mut c_void);
-    fn am_rtx_process(
-        context: *mut c_void,
-        frame: *const DmaBufFrame,
-        output: *mut c_void,
-        completion_fence: *mut i32,
-        error: *mut c_char,
-        capacity: usize,
-    ) -> i32;
-    fn am_rtx_wait_fence(fd: i32) -> i32;
+    fn am_rtx_finish(context: *mut c_void) -> i32;
     fn am_rtx_context_priority(context: *mut c_void) -> i32;
     fn am_rtx_take_timing(context: *mut c_void, totals: *mut GpuTiming);
 }
@@ -69,21 +55,14 @@ unsafe extern "C" {
 #[derive(Default, serde::Serialize)]
 struct GpuTiming {
     samples: u64,
-    slow_frames: u64,
-    queue_us: u64,
-    queue_max_us: u64,
-    sample_us: u64,
-    sample_max_us: u64,
-    model_us: u64,
-    model_max_us: u64,
-    model_run_us: u64,
-    model_run_max_us: u64,
-    output_us: u64,
-    output_max_us: u64,
-    total_us: u64,
-    total_max_us: u64,
+    gl_queue_us: u64,
+    gl_queue_max_us: u64,
+    gl_sample_us: u64,
+    gl_sample_max_us: u64,
+    cuda_pipeline_us: u64,
+    cuda_pipeline_max_us: u64,
 }
-const _: () = assert!(std::mem::size_of::<GpuTiming>() == 14 * 8);
+const _: () = assert!(std::mem::size_of::<GpuTiming>() == 7 * 8);
 
 /// Matches the host's other stage windows so the logs line up.
 const TIMING_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
@@ -94,96 +73,72 @@ impl Drop for NativeSession {
         // SAFETY: all output surfaces hold an Rc to this session and finish
         // their queued writes when closed; closing drains the CUDA stream.
         unsafe { am_rtx_close(self.0.as_ptr()) };
-    }
-}
-struct Slot {
-    session: Rc<NativeSession>,
-    output: NonNull<c_void>,
-    frame: DmaBufFrame,
-    busy: Cell<bool>,
-    /// Signals when the latest conversion into this slot has completed. Its
-    /// descriptor is lent as the output's acquire fence, so it is replaced
-    /// only while the slot has no outstanding lease reference.
-    acquire_fence: RefCell<Option<OwnedFd>>,
-}
-impl Drop for Slot {
-    fn drop(&mut self) {
-        assert!(
-            !self.busy.get(),
-            "HDR output destroyed with live references"
-        );
-        // SAFETY: this owns one output; session outlives the call and all work
-        // has retired before busy clears. No descriptors cross thread boundaries.
-        unsafe { am_rtx_output_close(self.session.0.as_ptr(), self.output.as_ptr()) };
+        NATIVE_SESSIONS.fetch_sub(1, Ordering::AcqRel);
     }
 }
 struct Stream {
-    slots: Vec<Rc<Slot>>,
-    /// CUDA output slots, allocated on the first resource-handoff frame.
+    session: Rc<NativeSession>,
     cuda_slots: Vec<Rc<resource::CudaSlot>>,
     cached_resource: Option<resource::CachedResource>,
     timing_reported: std::time::Instant,
-    cached: Option<CachedOutput>,
     pending_inputs: VecDeque<PendingInput>,
     width: u32,
     height: u32,
     enabled: bool,
     reported_enabled: Option<bool>,
 }
-struct Lease {
-    slot: Rc<Slot>,
-    references: Cell<u32>,
-}
-
-/// One reference keeps the most recent immutable result available for capture
-/// retries and keepalives. The cache owns a regular output lease, so downstream
-/// references continue to protect the same slot after the cache is replaced.
-struct CachedOutput {
-    lease: DmaBufFrameLease,
-    input_sequence: u64,
-}
-
-impl CachedOutput {
-    fn deliver(&self, input: &DmaBufFrame) -> Result<GpuOutputFrame, Status> {
-        let mut lease = self.lease;
-        lease.frame.sequence = input.sequence;
-        lease.frame.timestamp_us = input.timestamp_us;
-        // SAFETY: the cache owns a live reference throughout this retain.
-        let status = unsafe { retain(lease.context) };
-        if status != STATUS_OK {
-            return Err(status);
-        }
-        // SAFETY: the successful retain transfers one independent reference;
-        // the cache and any downstream owners keep the slot immutable.
-        unsafe { GpuOutputFrame::from_owned_lease(lease) }
-    }
-}
-
-impl Drop for CachedOutput {
-    fn drop(&mut self) {
-        // SAFETY: constructing the cache transferred exactly one reference.
-        unsafe { release(self.lease.context, -1) };
-    }
-}
-
 /// A borrowed input whose queued GPU reads may still be running. The fence
 /// signals after the conversion that read it, so release hands the fence to
 /// the input provider, which waits on it before reusing the storage.
-struct PendingInput {
-    input: Option<RetainedGpuInput>,
-    completion: Option<OwnedFd>,
+enum ReadCompletion {
+    Fence(OwnedFd),
+    Cuda(Rc<resource::CudaSlot>),
 }
-
+struct PendingInput {
+    input: Option<RetainedProcessingInput>,
+    completion: ReadCompletion,
+}
 impl PendingInput {
     fn completed(&self) -> bool {
-        self.completion.as_ref().is_none_or(fence_signalled)
+        match &self.completion {
+            ReadCompletion::Fence(fence) => fence_signalled(fence),
+            ReadCompletion::Cuda(slot) => slot.input_completed(),
+        }
     }
 }
-
 impl Drop for PendingInput {
     fn drop(&mut self) {
-        if let (Some(input), Some(completion)) = (self.input.take(), self.completion.take()) {
-            input.release_after(completion);
+        let Some(input) = self.input.take() else {
+            return;
+        };
+        match &self.completion {
+            ReadCompletion::Fence(completion) => {
+                let sync = FrameSyncFile {
+                    fd: completion.as_raw_fd(),
+                };
+                let descriptor = FrameDescriptor {
+                    kind: FRAME_SYNC_SYNC_FILE,
+                    version: 1,
+                    size: std::mem::size_of::<FrameSyncFile>() as u32,
+                    reserved: 0,
+                    namespace: [0; 16],
+                    data: std::ptr::from_ref(&sync).cast(),
+                };
+                // SAFETY: the dependency covers the queued GL sampling read;
+                // its source duplicates it before this descriptor is dropped.
+                unsafe { input.release_after(&descriptor) };
+            }
+            ReadCompletion::Cuda(slot) => {
+                // Only completed polling or the native teardown drain may
+                // retire CPU uploads. A missing proof keeps source storage pinned.
+                if !slot.input_completed() {
+                    input.quarantine();
+                    slot.quarantine();
+                    return;
+                }
+                unsafe { input.release_completed() };
+                slot.release_input();
+            }
         }
     }
 }
@@ -199,49 +154,6 @@ fn fence_signalled(fence: &OwnedFd) -> bool {
     // SAFETY: one live pollfd whose descriptor is held open by `fence`.
     let ready = unsafe { libc::poll(&mut poller, 1, 0) };
     ready == 1 && poller.revents & (libc::POLLIN | libc::POLLERR) != 0
-}
-
-unsafe extern "C" fn retain(context: *mut c_void) -> Status {
-    // SAFETY: each live descriptor pins its boxed lease through all references.
-    let lease = unsafe { &*context.cast::<Lease>() };
-    if lease.references.get() >= 64 {
-        return MEDIA_BUSY;
-    }
-    lease.references.set(lease.references.get() + 1);
-    STATUS_OK
-}
-unsafe extern "C" fn release(context: *mut c_void, fence: i32) {
-    if fence >= 0 {
-        // SAFETY: the ABI transfers this fd. Validate/wait before freeing any
-        // immutable pixels; failed completion must never allow reuse or unload.
-        let status = unsafe { am_rtx_wait_fence(fence) };
-        unsafe {
-            libc::close(fence);
-        }
-        if status != 0 {
-            std::process::abort();
-        }
-    }
-    // SAFETY: one retained reference is transferred back by this call.
-    let lease = unsafe { &*context.cast::<Lease>() };
-    let Some(remaining) = lease.references.get().checked_sub(1) else {
-        std::process::abort();
-    };
-    if remaining == 0 {
-        // SAFETY: the final reference uniquely owns the box. Completion was
-        // established above, so its pool slot can now be reused.
-        let lease = unsafe { Box::from_raw(context.cast::<Lease>()) };
-        lease.slot.busy.set(false);
-    } else {
-        lease.references.set(remaining);
-    }
-}
-
-/// One queued conversion: the output's acquire fence and, when the input was
-/// retained, that input with its own duplicate of the completion fence.
-struct QueuedConversion {
-    fence: OwnedFd,
-    input: Option<PendingInput>,
 }
 
 const EGL_CONTEXT_PRIORITY_HIGH_IMG: i32 = 0x3101;
@@ -307,38 +219,16 @@ impl Stream {
                 error.len(),
             )
         };
-        let session = Rc::new(NativeSession(
-            NonNull::new(raw).ok_or_else(|| backend_failure(&error, logger))?,
-        ));
+        let raw = NonNull::new(raw).ok_or_else(|| backend_failure(&error, logger))?;
+        NATIVE_SESSIONS.fetch_add(1, Ordering::AcqRel);
+        let session = Rc::new(NativeSession(raw));
         Self::configure_session(&session, settings, true, logger)?;
-        let mut slots = Vec::new();
-        for _ in 0..settings.output_buffers {
-            // SAFETY: zeroed scalar descriptor is initialized by successful open.
-            let mut frame: DmaBufFrame = unsafe { std::mem::zeroed() };
-            let raw = unsafe {
-                am_rtx_output_open(
-                    session.0.as_ptr(),
-                    &mut frame,
-                    error.as_mut_ptr(),
-                    error.len(),
-                )
-            };
-            let output = NonNull::new(raw).ok_or_else(|| backend_failure(&error, logger))?;
-            slots.push(Rc::new(Slot {
-                session: session.clone(),
-                output,
-                frame,
-                busy: Cell::new(false),
-                acquire_fence: RefCell::new(None),
-            }));
-        }
         report_context_priority(&session, logger);
         Ok(Self {
-            slots,
+            session,
             cuda_slots: Vec::new(),
             cached_resource: None,
             timing_reported: std::time::Instant::now(),
-            cached: None,
             pending_inputs: VecDeque::new(),
             width,
             height,
@@ -377,148 +267,11 @@ impl Stream {
         enabled: bool,
         logger: Option<&amaterasu_module_sdk::LogEmitter>,
     ) -> Result<(), Status> {
-        Self::configure_session(&self.slots[0].session, settings, enabled, logger)?;
+        Self::configure_session(&self.session, settings, enabled, logger)?;
         // A live settings or foreground change can alter pixels even if the
         // capture provider keeps presenting the same source frame.
-        self.cached = None;
+        self.cached_resource = None;
         Ok(())
-    }
-
-    fn process(
-        &mut self,
-        source: &GpuFrame<'_>,
-        logger: Option<&amaterasu_module_sdk::LogEmitter>,
-    ) -> Result<GpuOutputFrame, Status> {
-        let input = source.frame();
-        if input.width != self.width || input.height != self.height {
-            return Err(MEDIA_UNSUPPORTED);
-        }
-        self.retire_completed_inputs();
-        self.report_timing(logger);
-        if source.freshness() == CAPTURE_FRAME_CACHED_REUSE
-            && let Some(cached) = self.cached.as_ref()
-            && cached.input_sequence == input.sequence
-        {
-            return cached.deliver(input);
-        }
-        // Free the cache's reference before finding a slot. In-flight encoder
-        // references still protect old output until they are retired.
-        self.cached = None;
-        let slot = self
-            .slots
-            .iter()
-            .find(|slot| !slot.busy.get())
-            .ok_or(MEDIA_BUSY)?
-            .clone();
-        // Keep the input readable after return while its conversion is still
-        // queued. Without a reference, complete it before returning instead.
-        let retained = source.retain().ok();
-        let completion = Self::convert(&slot, input, logger, retained)?;
-        slot.busy.set(true);
-        let mut frame = DmaBufFrame {
-            sequence: input.sequence,
-            timestamp_us: input.timestamp_us,
-            ..slot.frame
-        };
-        frame.planes[0].acquire_fence_fd = completion
-            .as_ref()
-            .map_or(-1, |pending| pending.fence.as_raw_fd());
-        if let Some(pending) = completion {
-            *slot.acquire_fence.borrow_mut() = Some(pending.fence);
-            self.queue_pending_input(pending.input);
-        }
-        let lease = Box::new(Lease {
-            slot,
-            references: Cell::new(1),
-        });
-        self.cached = Some(CachedOutput {
-            lease: DmaBufFrameLease {
-                frame,
-                context: Box::into_raw(lease).cast(),
-                retain: Some(retain),
-                release: Some(release),
-            },
-            input_sequence: input.sequence,
-        });
-        self.cached
-            .as_ref()
-            .expect("cache was populated")
-            .deliver(input)
-    }
-
-    /// Queues one conversion into an idle `slot`. Returns its completion fence
-    /// with the retained input it covers, or None once the work has finished.
-    fn convert(
-        slot: &Slot,
-        input: &DmaBufFrame,
-        logger: Option<&amaterasu_module_sdk::LogEmitter>,
-        retained: Option<RetainedGpuInput>,
-    ) -> Result<Option<QueuedConversion>, Status> {
-        // The slot's previous fence must outlive no reader: it is idle, so no
-        // lease still lends that descriptor. Its writes precede ours in order.
-        slot.acquire_fence.borrow_mut().take();
-        let mut error = [0; 512];
-        let mut fence = -1;
-        // SAFETY: the SDK lends immutable input pixels until this returns, and
-        // `retained` extends that until the returned fence signals. This idle
-        // slot is exclusively writable, with no downstream reference.
-        let result = unsafe {
-            am_rtx_process(
-                slot.session.0.as_ptr(),
-                input,
-                slot.output.as_ptr(),
-                &mut fence,
-                error.as_mut_ptr(),
-                error.len(),
-            )
-        };
-        if result != 0 {
-            // The backend drained the GPU before reporting failure.
-            if let Some(retained) = retained {
-                // SAFETY: the failed call synchronized every queued read.
-                unsafe { retained.release_completed() };
-            }
-            return Err(backend_failure(&error, logger));
-        }
-        if fence < 0 {
-            if let Some(retained) = retained {
-                // SAFETY: no fence means the backend completed synchronously.
-                unsafe { retained.release_completed() };
-            }
-            return Ok(None);
-        }
-        // SAFETY: the backend transfers ownership of this new sync_file.
-        let fence = unsafe { OwnedFd::from_raw_fd(fence) };
-        let Some(retained) = retained else {
-            // The borrowed input must be fully read before returning.
-            Self::wait_input_reads(&fence);
-            return Ok(Some(QueuedConversion { fence, input: None }));
-        };
-        let input_fence = match fence.try_clone() {
-            Ok(input_fence) => input_fence,
-            Err(_) => {
-                Self::wait_input_reads(&fence);
-                // SAFETY: the wait above established completion of every read.
-                unsafe { retained.release_completed() };
-                return Ok(Some(QueuedConversion { fence, input: None }));
-            }
-        };
-        Ok(Some(QueuedConversion {
-            fence,
-            input: Some(PendingInput {
-                input: Some(retained),
-                completion: Some(input_fence),
-            }),
-        }))
-    }
-
-    fn wait_input_reads(fence: &OwnedFd) {
-        // SAFETY: the borrowed descriptor stays open throughout the wait.
-        if unsafe { am_rtx_wait_fence(fence.as_raw_fd()) } != 0 {
-            // A failed GPU fence cannot prove the input reads finished, and
-            // the input provider would reuse its storage after this returns.
-            std::process::abort();
-        }
     }
 
     fn queue_pending_input(&mut self, pending: Option<PendingInput>) {
@@ -526,10 +279,10 @@ impl Stream {
             return;
         };
         self.pending_inputs.push_back(pending);
-        while self.pending_inputs.len() > MAX_PENDING_INPUTS {
-            // Dropping hands the fence to the input provider, which waits.
-            self.pending_inputs.pop_front();
-        }
+        assert!(
+            self.pending_inputs.len() <= MAX_PENDING_INPUTS,
+            "input capacity reserved before enqueue"
+        );
     }
 
     fn retire_completed_inputs(&mut self) {
@@ -544,7 +297,7 @@ impl Stream {
 
     /// Logs the window's GPU stage times. Reading never waits for the GPU.
     fn report_timing(&mut self, logger: Option<&amaterasu_module_sdk::LogEmitter>) {
-        let (Some(logger), Some(slot)) = (logger, self.slots.first()) else {
+        let Some(logger) = logger else {
             return;
         };
         if self.timing_reported.elapsed() < TIMING_WINDOW {
@@ -553,10 +306,10 @@ impl Stream {
         self.timing_reported = std::time::Instant::now();
         let mut timing = GpuTiming::default();
         // SAFETY: the session is live and the record has the C layout.
-        unsafe { am_rtx_take_timing(slot.session.0.as_ptr(), &mut timing) };
+        unsafe { am_rtx_take_timing(self.session.0.as_ptr(), &mut timing) };
         let mut message = serde_json::to_value(&timing).unwrap_or_default();
         message["event"] = "rtx_hdr_gpu_timing".into();
-        message["scope"] = "gpu_clock_submit_to_output_written".into();
+        message["scope"] = "gl_sampling_and_cuda_pipeline_not_end_to_end".into();
         let _ = logger.emit(
             amaterasu_module_sdk::LogLevel::Info,
             "rtx-hdr",
@@ -565,18 +318,12 @@ impl Stream {
     }
 
     fn retire_inputs(&mut self) {
-        // Each release passes its fence; the input provider waits before reuse.
-        self.pending_inputs.clear();
-    }
-
-    fn assert_retired(&self) {
-        // Video cancels downstream encoders before this stage. A reference here
-        // means that barrier failed: do not unload a provider with live storage.
-        if self.slots.iter().any(|slot| slot.busy.get())
-            || self.cuda_slots.iter().any(|slot| slot.is_referenced())
-        {
+        // Teardown is the sole synchronous barrier. Ordinary frame dispatch
+        // only polls and returns BUSY when bounded storage is occupied.
+        if unsafe { am_rtx_finish(self.session.0.as_ptr()) } != 0 {
             std::process::abort();
         }
+        self.pending_inputs.clear();
     }
 }
 
@@ -593,6 +340,8 @@ pub(crate) struct Processor {
     /// Negotiated resource outputs per configured stream.
     resource_outputs: BTreeMap<u64, resource::ResourceOutput>,
     device_uuid: Option<[u8; 16]>,
+    input_offers: input::InputOffers,
+    selected_inputs: BTreeMap<u64, input::SelectedInput>,
 }
 impl Processor {
     pub fn new(settings: Settings) -> Self {
@@ -608,6 +357,8 @@ impl Processor {
             logger: None,
             resource_outputs: BTreeMap::new(),
             device_uuid: None,
+            input_offers: input::InputOffers::new(),
+            selected_inputs: BTreeMap::new(),
         }
     }
     pub fn with_policy(
@@ -648,28 +399,11 @@ impl Processor {
 
     /// Opens the stream on its first frame and applies the current
     /// enablement. Returns whether conversion is active for this frame.
-    fn prepare(&mut self, stream: u64, frame: &DmaBufFrame) -> Result<bool, Status> {
+    fn prepare(&mut self, stream: u64, frame: &CaptureResourceFrame) -> Result<bool, Status> {
         if self.retired.contains(&stream) {
             return Err(MEDIA_CLOSED);
         }
-        if !supported_input(frame) {
-            if let Some(logger) = &self.logger {
-                let message = serde_json::json!({
-                    "event": "rtx_hdr_input_rejected",
-                    "stream": stream,
-                    "width": frame.width,
-                    "height": frame.height,
-                    "color": frame.color,
-                    "fourcc": frame.fourcc,
-                    "planes": frame.plane_count,
-                    "pitch": frame.planes[0].pitch,
-                    "offset": frame.planes[0].offset,
-                })
-                .to_string();
-                let _ = logger.emit(amaterasu_module_sdk::LogLevel::Error, "rtx-hdr", &message);
-            }
-            return Err(MEDIA_UNSUPPORTED);
-        }
+        let enabled = self.conversion_enabled(stream)?;
         if !self.streams.contains_key(&stream) {
             if self.streams.len() >= self.settings.max_streams || self.retired.len() >= 1024 {
                 return Err(MEDIA_BUSY);
@@ -692,21 +426,6 @@ impl Processor {
             );
         }
         let settings = self.stream_settings.get(&stream).unwrap_or(&self.settings);
-        let enabled = settings.enabled
-            && if !settings.foreground_only && !settings.fullscreen_only {
-                true
-            } else {
-                self.policy.as_ref().is_some_and(|policy| {
-                    policy.lock().ok().is_some_and(|policy| {
-                        policy.enabled(
-                            self.targets.get(&stream).and_then(Option::as_ref),
-                            settings.foreground_only,
-                            settings.fullscreen_only,
-                            std::time::Instant::now(),
-                        )
-                    })
-                })
-            };
         let active = self.streams.get_mut(&stream).expect("stream was opened");
         if active.enabled != enabled {
             active.configure(settings, enabled, self.logger.as_ref())?;
@@ -715,7 +434,31 @@ impl Processor {
         Ok(enabled)
     }
 
-    fn report_conversion(&mut self, stream: u64, frame: &DmaBufFrame, enabled: bool) {
+    fn conversion_enabled(&self, stream: u64) -> Result<bool, Status> {
+        let settings = self.stream_settings.get(&stream).unwrap_or(&self.settings);
+        if !settings.enabled {
+            return Ok(false);
+        }
+        if !settings.foreground_only && !settings.fullscreen_only {
+            return Ok(true);
+        }
+        let Some(policy) = &self.policy else {
+            return Ok(false);
+        };
+        let policy = match policy.try_lock() {
+            Ok(policy) => policy,
+            Err(std::sync::TryLockError::WouldBlock) => return Err(MEDIA_BUSY),
+            Err(_) => return Err(MEDIA_BACKEND_ERROR),
+        };
+        Ok(policy.enabled(
+            self.targets.get(&stream).and_then(Option::as_ref),
+            settings.foreground_only,
+            settings.fullscreen_only,
+            std::time::Instant::now(),
+        ))
+    }
+
+    fn report_conversion(&mut self, stream: u64, frame: &CaptureResourceFrame, enabled: bool) {
         let settings = self.stream_settings.get(&stream).unwrap_or(&self.settings);
         let Some(active) = self.streams.get_mut(&stream) else {
             return;
@@ -754,7 +497,7 @@ impl Drop for Processor {
         self.clear_demand();
     }
 }
-impl GpuFrameProcessor for Processor {
+impl FrameProcessor for Processor {
     fn configure_stream(&mut self, stream: u64, json: &[u8]) -> Result<(), Status> {
         if self.retired.contains(&stream) {
             return Err(MEDIA_CLOSED);
@@ -813,12 +556,20 @@ impl GpuFrameProcessor for Processor {
         self.stream_settings.insert(stream, settings);
         Ok(())
     }
-    fn process(&mut self, stream: u64, input: GpuFrame<'_>) -> Result<GpuOutputFrame, Status> {
-        let enabled = self.prepare(stream, input.frame())?;
-        let active = self.streams.get_mut(&stream).expect("stream was prepared");
-        let output = active.process(&input, self.logger.as_ref())?;
-        self.report_conversion(stream, input.frame(), enabled);
-        Ok(output)
+    fn input_offers(&mut self, _: u64) -> Result<(u64, Vec<CaptureResourceOffer>), Status> {
+        Ok(self.input_offers.enumerate())
+    }
+    fn configure_input(
+        &mut self,
+        stream: u64,
+        generation: u64,
+        offer: u64,
+        _: u64,
+        source: &CaptureResourceOffer,
+    ) -> Result<(), Status> {
+        let selected = self.input_offers.select(generation, offer, source)?;
+        self.selected_inputs.insert(stream, selected);
+        Ok(())
     }
     fn output_offers(&mut self, stream: u64) -> Result<(u64, Vec<CaptureResourceOffer>), Status> {
         if self.retired.contains(&stream) {
@@ -843,23 +594,33 @@ impl GpuFrameProcessor for Processor {
             .ok_or(MEDIA_UNSUPPORTED)?
             .select(generation, offer)
     }
-    fn process_to_resource(
+    fn process(
         &mut self,
         stream: u64,
-        input: GpuFrame<'_>,
+        source: ProcessingFrame<'_>,
     ) -> Result<ResourceOutputFrame, Status> {
+        let input = self
+            .selected_inputs
+            .get(&stream)
+            .ok_or(MEDIA_UNSUPPORTED)?
+            .frame(source)?;
         let handoff = self
             .resource_outputs
             .get(&stream)
             .and_then(resource::ResourceOutput::selection)
             .ok_or(MEDIA_UNSUPPORTED)?;
         let device_uuid = self.device_uuid()?;
-        let enabled = self.prepare(stream, input.frame())?;
         let output_buffers = self
             .stream_settings
             .get(&stream)
             .unwrap_or(&self.settings)
             .output_buffers;
+        resource::validate_storage_budget(
+            input.descriptor().width,
+            input.descriptor().height,
+            output_buffers,
+        )?;
+        let enabled = self.prepare(stream, input.descriptor())?;
         let active = self.streams.get_mut(&stream).expect("stream was prepared");
         let output = active.process_resource(
             &input,
@@ -868,7 +629,7 @@ impl GpuFrameProcessor for Processor {
             device_uuid,
             self.logger.as_ref(),
         )?;
-        self.report_conversion(stream, input.frame(), enabled);
+        self.report_conversion(stream, input.descriptor(), enabled);
         Ok(output)
     }
     fn cancel(&mut self, stream: u64) {
@@ -876,11 +637,10 @@ impl GpuFrameProcessor for Processor {
         self.stream_settings.remove(&stream);
         self.targets.remove(&stream);
         self.resource_outputs.remove(&stream);
+        self.selected_inputs.remove(&stream);
         if let Some(mut active) = self.streams.remove(&stream) {
-            active.cached = None;
             active.cached_resource = None;
             active.retire_inputs();
-            active.assert_retired();
         }
         if self.retired.len() < 1024 {
             self.retired.insert(stream);
@@ -888,11 +648,10 @@ impl GpuFrameProcessor for Processor {
     }
     fn shutdown(&mut self) {
         self.resource_outputs.clear();
+        self.selected_inputs.clear();
         for stream in self.streams.values_mut() {
-            stream.cached = None;
             stream.cached_resource = None;
             stream.retire_inputs();
-            stream.assert_retired();
         }
         self.streams.clear();
         self.clear_demand();
@@ -909,22 +668,12 @@ impl GpuFrameProcessor for Processor {
     }
 }
 
-/// SDR scanout may use either eight-bit or ten-bit packed RGB. EGL samples
-/// both into the same RGBA8 model input; bit depth does not imply HDR transfer.
-fn supported_input(frame: &DmaBufFrame) -> bool {
-    frame.color == DMABUF_COLOR_SRGB
-        && frame.plane_count == 1
-        && matches!(
-            frame.fourcc.to_le_bytes(),
-            [b'X' | b'A', b'R' | b'B', b'2', b'4'] | [b'X' | b'A', b'R' | b'B', b'3', b'0']
-        )
-        && (16..=8192).contains(&frame.width)
-        && (16..=8192).contains(&frame.height)
-        && u64::from(frame.width) * u64::from(frame.height) * 4 <= MAX_FRAME_BYTES as u64
-        && frame.planes[0].offset <= i32::MAX as u32
-        && frame.planes[0].pitch <= i32::MAX as u32
-}
-
+mod input;
 mod resource;
 #[cfg(test)]
 mod tests;
+
+pub(crate) fn retirement_ready() -> Result<bool, Status> {
+    resource::retirement_ready()
+        .map(|retired| retired && NATIVE_SESSIONS.load(Ordering::Acquire) == 0)
+}

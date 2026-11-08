@@ -78,7 +78,6 @@ inline void vfx_check(int result, const char *operation) {
     if (result != 0)
         throw std::runtime_error(std::string(operation) + ": VFX " + std::to_string(result));
 }
-void wait_fence(int fd);
 
 struct Surface {
     int render_fd = -1;
@@ -93,8 +92,8 @@ struct Surface {
     PFNEGLDUPNATIVEFENCEFDANDROIDPROC duplicate_fence = nullptr;
     PFNEGLWAITSYNCKHRPROC wait_sync = nullptr;
     bool priority_query = false;
-    GLuint input = 0, output = 0, input_fbo = 0, output_fbo = 0;
-    GLuint source = 0, program = 0, output_program = 0, fallback_program = 0, vao = 0;
+    GLuint input = 0, input_fbo = 0;
+    GLuint source = 0, program = 0, vao = 0;
     void open(CUdevice device);
     void prepare(uint32_t width, uint32_t height);
     EGLImageKHR import(const AmaterasuDmaBufFrame &frame);
@@ -106,15 +105,12 @@ struct Surface {
 
 /* GPU-clock stage times summed since the last take. Mirrored in linux.rs. */
 struct TimingTotals {
-    uint64_t samples, slow_frames;
-    uint64_t queue_us, queue_max_us;   /* submit until the GPU starts sampling */
-    uint64_t sample_us, sample_max_us; /* input sampling draw */
-    uint64_t model_us, model_max_us;   /* sampled until GL resumes after CUDA */
-    uint64_t model_run_us, model_run_max_us; /* CUDA execution of the model */
-    uint64_t output_us, output_max_us; /* PQ output draw */
-    uint64_t total_us, total_max_us;   /* submit until the output is written */
+    uint64_t samples;
+    uint64_t gl_queue_us, gl_queue_max_us;
+    uint64_t gl_sample_us, gl_sample_max_us;
+    uint64_t cuda_pipeline_us, cuda_pipeline_max_us;
 };
-static_assert(sizeof(TimingTotals) == 14 * sizeof(uint64_t));
+static_assert(sizeof(TimingTotals) == 7 * sizeof(uint64_t));
 
 /* Timestamps for a few frames in flight. Results are read only once ready,
  * so measuring never makes the processing thread wait for the GPU. */
@@ -126,13 +122,12 @@ class Timing {
     void started();
     void sampled();
     void model_queued(Api &api, CUstream stream, bool before);
-    void resumed();
     void finished();
     TimingTotals take(Api &api);
 
   private:
     struct Frame {
-        GLuint queries[4]{};
+        GLuint queries[2]{};
         CUevent events[2]{};
         GLint64 submitted = 0;
         bool pending = false, modeled = false;
@@ -156,16 +151,6 @@ struct Current {
     ~Current();
 };
 
-struct Output {
-    gbm_bo *buffer = nullptr;
-    EGLImageKHR image = EGL_NO_IMAGE_KHR;
-    GLuint texture = 0, fbo = 0;
-    AmaterasuDmaBufFrame frame{};
-    void open(Surface &surface, uint32_t width, uint32_t height,
-              uint32_t format = GBM_FORMAT_ABGR2101010);
-    void close(Surface &surface);
-};
-
 /* One CUDA output slot: pitch-linear X2B10G10R10 memory in the primary
  * context and the event recorded after each write into it. */
 struct CudaOutput {
@@ -182,19 +167,21 @@ struct Session {
     Surface surface;
     Image input{}, output{};
     void *effect = nullptr;
-    CUgraphicsResource input_resource = nullptr, output_resource = nullptr;
+    CUgraphicsResource input_resource = nullptr;
     bool retained_context = false;
     Timing timing;
     CUmodule kernels = nullptr;
-    CUfunction pq_output = nullptr, sdr_output = nullptr;
+    CUfunction pq_output = nullptr, sdr_output = nullptr, cpu_input = nullptr;
+    CUdeviceptr upload = 0;
+    size_t upload_pitch = 0, upload_rows = 0;
+    void upload_cpu(const AmaterasuCpuFrame &frame, const AmaterasuFrameColorMetadata &color);
+    void run_cpu_cuda(const AmaterasuCpuFrame &frame, const AmaterasuFrameColorMetadata &color, CudaOutput &destination);
     bool enabled = true;
     uint32_t sdr_brightness = 0;
     std::array<uint32_t, 5> parameters{};
     Session(const std::string &root, int ordinal, uint32_t width, uint32_t height,
             const uint32_t *parameters);
     ~Session();
-    int run(const AmaterasuDmaBufFrame &frame, Output &destination);
-    void convert();
     void copy_input();
     void load_kernels();
     void write_output(CudaOutput &destination);
@@ -209,11 +196,8 @@ struct Session {
 extern "C" {
 void *am_rtx_open(const char *, int, uint32_t, uint32_t, const uint32_t *, char *, size_t);
 void am_rtx_close(void *);
-void *am_rtx_output_open(void *, AmaterasuDmaBufFrame *, char *, size_t);
-void am_rtx_output_close(void *, void *);
-int am_rtx_process(void *, const AmaterasuDmaBufFrame *, void *, int *, char *, size_t);
+int am_rtx_finish(void *);
 int am_rtx_configure(void *, const uint32_t *, bool, uint32_t, char *, size_t);
-int am_rtx_wait_fence(int);
 int am_rtx_context_priority(void *);
 void am_rtx_take_timing(void *, rtx::TimingTotals *);
 int am_rtx_device_uuid(const char *, int, uint8_t *, char *, size_t);

@@ -94,3 +94,51 @@ extern "C" __global__ void am_rtx_sdr_output(const unsigned char *source, unsign
     reinterpret_cast<unsigned int *>(target + (size_t)y * target_pitch)[x] =
         pack(code[0], code[1], code[2]);
 }
+
+// Explicit CPU-source import. The staging allocation is uploaded in source
+// layout; this GPU kernel converts that negotiated layout to the VFX RGBA8 input.
+__device__ static float input_srgb(float encoded, unsigned int transfer) {
+    encoded = fminf(fmaxf(encoded, 0.0f), 1.0f);
+    if (transfer == 1u) return encoded; // sRGB is already the model's input.
+    const float linear = encoded < 0.081f ? encoded / 4.5f
+        : powf((encoded + 0.099f) / 1.099f, 1.0f / 0.45f);
+    return linear < 0.0031308f ? 12.92f * linear : 1.055f * powf(linear, 1.0f / 2.4f) - 0.055f;
+}
+extern "C" __global__ void am_rtx_cpu_input(const unsigned char *source, unsigned int source_pitch,
+    unsigned char *target, unsigned int target_pitch, int width, int height,
+    unsigned int format, unsigned int transfer, unsigned int range) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
+    float red, green, blue;
+    if (format == 1u) { // BGRA8
+        const uchar4 value = reinterpret_cast<const uchar4 *>(source + (size_t)y * source_pitch)[x];
+        red = value.z / 255.0f; green = value.y / 255.0f; blue = value.x / 255.0f;
+    } else {
+        const unsigned char *chroma = source + (size_t)(height + y / 2) * source_pitch;
+        float luma, cb, cr;
+        if (format == 3u) { // P010: high ten bits of little-endian words.
+            luma = (float)(reinterpret_cast<const unsigned short *>(source + (size_t)y * source_pitch)[x] >> 6);
+            cb = (float)(reinterpret_cast<const unsigned short *>(chroma)[x & ~1] >> 6);
+            cr = (float)(reinterpret_cast<const unsigned short *>(chroma)[(x & ~1) + 1] >> 6);
+            luma = range == 2u ? (luma - 64.0f) / 876.0f : luma / 1023.0f;
+            cb = (cb - 512.0f) / (range == 2u ? 896.0f : 1023.0f);
+            cr = (cr - 512.0f) / (range == 2u ? 896.0f : 1023.0f);
+        } else { // NV12
+            luma = source[(size_t)y * source_pitch + x];
+            cb = chroma[x & ~1]; cr = chroma[(x & ~1) + 1];
+            luma = range == 2u ? (luma - 16.0f) / 219.0f : luma / 255.0f;
+            cb = (cb - 128.0f) / (range == 2u ? 224.0f : 255.0f);
+            cr = (cr - 128.0f) / (range == 2u ? 224.0f : 255.0f);
+        }
+        red = luma + 1.5748f * cr;
+        green = luma - 0.187324f * cb - 0.468124f * cr;
+        blue = luma + 1.8556f * cb;
+    }
+    uchar4 value;
+    value.x = (unsigned char)__float2uint_rn(input_srgb(red, transfer) * 255.0f);
+    value.y = (unsigned char)__float2uint_rn(input_srgb(green, transfer) * 255.0f);
+    value.z = (unsigned char)__float2uint_rn(input_srgb(blue, transfer) * 255.0f);
+    value.w = 255;
+    reinterpret_cast<uchar4 *>(target + (size_t)y * target_pitch)[x] = value;
+}
