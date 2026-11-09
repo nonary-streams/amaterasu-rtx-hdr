@@ -87,6 +87,15 @@ Then follow [local signed package updates](../../docs/local-package-updates.md)
 to import and activate the exact verified digest. Those instructions retain the
 existing publisher, policy, replay and service-pin checks.
 
+An installation whose policy still holds the earlier RTX HDR wiring in provider
+settings needs no separate migration command. `review-package-activation-policy`
+recognizes it, proposes the destination with that wiring moved into a processing
+composition, and records `legacy_rtx_wiring_converted` in the report. Capture,
+frame-lease, runtime and other host settings are carried over unchanged. Because
+the older host cannot parse a composition policy, activate through the matching
+new host, and `provision-package-activation` replaces an earlier allowlist only
+when the same publisher issued it and every value it approved is already applied.
+
 The separate CPU pass-through example in the SDK workspace demonstrates the
 same native-only flow. See [the frame-processing SDK guide](../../docs/gpu-processing-sdk.md)
 for its complete component, selection, review and signing example.
@@ -143,10 +152,13 @@ TrueHDR only while the selected foreground provider reports the exact executable
 associated with the stream lifecycle target. Missing, stale, or mismatched
 observations use the SDR-in-HDR fallback. When fullscreen-only is enabled,
 conversion additionally requires a fresh, explicitly fullscreen observation;
-unknown fullscreen state also falls back. Trusted startup composition must set
-`foreground_context_service` and grant this plugin access to the selected
-versioned foreground-context implementation and to lifecycle
-`read_provider_context`. No observer is silently selected. Foreground identity
+unknown fullscreen state also falls back. Trusted startup composition must bind
+a foreground provider through the `foreground` field of its
+`ProcessingSelection` and grant this plugin access to that versioned
+foreground-context implementation and to lifecycle `read_provider_context`.
+`review-package-activation-policy` binds the built-in provider by default when
+the installed policy approves that component. No observer is silently selected.
+Foreground identity
 is an absolute executable path; launchers, Steam URIs and Proton/Wine processes
 may not match a game's configured executable, so these cases fall back rather
 than establishing game identity. Native Wayland requires a compositor-backed

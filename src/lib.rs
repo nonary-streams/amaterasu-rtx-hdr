@@ -153,9 +153,7 @@ impl ManagedModule for RtxHdr {
         let settings: Settings = serde_json::from_value(payload)
             .map_err(|error| format!("invalid RTX HDR settings: {error}"))?;
         settings.validate()?;
-        if foreground_service.is_none() && (settings.foreground_only || settings.fullscreen_only) {
-            return Err("foreground restrictions require a selected foreground provider".into());
-        }
+        require_foreground_provider(&settings, foreground_service.as_deref())?;
         #[cfg(not(all(target_os = "linux", feature = "linux-nvidia")))]
         let _ = (
             &registry_principal,
@@ -363,4 +361,63 @@ impl ManagedModule for RtxHdr {
     }
 }
 
+/// Foreground and fullscreen gates can only be evaluated through a selected
+/// provider, so a composition without one cannot accept those settings.
+fn require_foreground_provider(
+    settings: &Settings,
+    foreground_service: Option<&str>,
+) -> ModuleResult<()> {
+    if foreground_service.is_none() && (settings.foreground_only || settings.fullscreen_only) {
+        return Err("foreground restrictions require a selected foreground provider".into());
+    }
+    Ok(())
+}
+
 amaterasu_module_sdk::export_module!(RtxHdr);
+
+#[cfg(test)]
+mod foreground_selection_tests {
+    use super::*;
+    use amaterasu_module_sdk::processing_composition::ProcessingComposition;
+
+    fn settings(foreground_only: bool) -> Settings {
+        serde_json::from_value(serde_json::json!({
+            "runtime_directory": "/tmp/rtx-runtime",
+            "foreground_only": foreground_only,
+        }))
+        .unwrap()
+    }
+
+    fn migrated_policy() -> serde_json::Value {
+        let path = std::env::var("AMATERASU_MIGRATED_REPORT").unwrap();
+        let report: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        report["optional_bootstrap"]["policy"].clone()
+    }
+
+    #[test]
+    fn foreground_only_settings_need_a_selected_provider() {
+        let service = amaterasu_module_sdk::foreground_context::SERVICE;
+        assert!(require_foreground_provider(&settings(false), None).is_ok());
+        assert!(require_foreground_provider(&settings(true), None).is_err());
+        assert!(require_foreground_provider(&settings(true), Some(service)).is_ok());
+    }
+
+    #[test]
+    #[ignore = "needs AMATERASU_MIGRATED_REPORT from the release review"]
+    fn reviewed_installed_policy_starts_rtx_hdr() {
+        let policy = migrated_policy();
+        let id = "amaterasu.rtx-hdr";
+        let parsed: Settings = serde_json::from_value(policy["settings"][id].clone()).unwrap();
+        parsed.validate().unwrap();
+        let composition: ProcessingComposition =
+            serde_json::from_value(policy["processing_compositions"][id].clone()).unwrap();
+        let foreground = composition.foreground.as_ref().unwrap();
+        assert_eq!(
+            foreground.service,
+            amaterasu_module_sdk::foreground_context::SERVICE
+        );
+        let persisted = settings(true);
+        assert!(require_foreground_provider(&persisted, Some(&foreground.service)).is_ok());
+    }
+}
