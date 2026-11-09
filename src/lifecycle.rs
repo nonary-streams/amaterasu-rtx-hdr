@@ -4,14 +4,13 @@
 //! owns the frozen settings snapshot and only its selected broker principal may
 //! request a plan or callback.
 use amaterasu_module_sdk::{
-    ApiFieldKind as Kind, ApiMethod, ApiPrivilege, ApiSchema, Command, ModuleResult,
+    Command, ModuleResult,
     extension_api::{
-        self, ConsumerChange, LifecyclePhase, ProviderOperation, ProviderRequest, ProviderResponse,
-        ResourcePlan,
+        self, ConsumerChange, LifecyclePhase, ProviderOperation, ProviderResponse, ResourcePlan,
     },
+    processing_provider::{self, LifecycleDelivery},
 };
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
 
 #[derive(Clone)]
 pub(crate) struct Selection {
@@ -37,85 +36,10 @@ pub(crate) fn selection(
     }))
 }
 
-fn schema(required: &[(&str, Kind)], optional: &[(&str, Kind)]) -> ApiSchema {
-    ApiSchema {
-        required: required
-            .iter()
-            .cloned()
-            .map(|(name, kind)| (name.into(), kind))
-            .collect(),
-        optional: optional
-            .iter()
-            .cloned()
-            .map(|(name, kind)| (name.into(), kind))
-            .collect::<BTreeMap<_, _>>(),
-        allow_extra: false,
-    }
-}
-
 pub(crate) fn registrations() -> Vec<Command> {
-    ["resource_plan", "lifecycle_callback", "lifecycle_status"]
+    processing_provider::lifecycle_methods(crate::settings_descriptor::SERVICE)
         .into_iter()
-        .map(|method| Command::RegisterApi {
-            method: ApiMethod {
-                service: crate::settings_descriptor::SERVICE.into(),
-                method: method.into(),
-                interface_major: 1,
-                interface_minor: 0,
-                request: if method == "lifecycle_status" {
-                    schema(
-                        &[
-                            ("provider_sequence", Kind::Integer),
-                            ("transition_id", Kind::String),
-                            ("operation_id", Kind::String),
-                            ("receipt_id", Kind::String),
-                        ],
-                        &[],
-                    )
-                } else {
-                    schema(
-                        &[
-                            ("provider_sequence", Kind::Integer),
-                            ("operation", Kind::String),
-                            ("version", Kind::Integer),
-                            ("transition_id", Kind::String),
-                            ("operation_id", Kind::String),
-                            ("target", Kind::Object),
-                            ("phase", Kind::String),
-                            ("settings_revision", Kind::String),
-                            ("settings", Kind::Object),
-                            ("intent", Kind::Any),
-                            ("reason", Kind::Any),
-                            ("requested_video", Kind::Any),
-                            ("consumer_requirements", Kind::Object),
-                            ("remaining_ms", Kind::Integer),
-                            ("plan_revision", Kind::Any),
-                            ("admission_id", Kind::Any),
-                            ("approved_plan", Kind::Any),
-                        ],
-                        &[
-                            ("resource_generation", Kind::Integer),
-                            ("dependency_inputs", Kind::Array),
-                            ("control_results", Kind::Array),
-                            ("source_video_mode", Kind::Any),
-                            ("join_context", Kind::Object),
-                        ],
-                    )
-                },
-                response: schema(
-                    &[("status", Kind::String)],
-                    &[
-                        ("reason", Kind::String),
-                        ("plan", Kind::Object),
-                        ("candidate", Kind::Any),
-                        ("obligations", Kind::Array),
-                        ("outputs", Kind::Array),
-                        ("outcomes", Kind::Array),
-                    ],
-                ),
-                privilege: ApiPrivilege::User,
-            },
-        })
+        .map(|method| Command::RegisterApi { method })
         .collect()
 }
 
@@ -126,32 +50,13 @@ pub(crate) fn handle(caller: &str, selected: &Selection, payload: Value) -> Valu
     if caller != selected.principal {
         return rejected("unauthorized_caller");
     }
-    let Some(envelope) = payload.as_object().filter(|value| value.len() == 4) else {
-        return rejected("invalid_request");
+    let request = match processing_provider::decode_lifecycle_delivery(&payload) {
+        Ok(LifecycleDelivery::Status) => {
+            return json!({"status":"recovery_required", "reason":"unknown_receipt"});
+        }
+        Ok(LifecycleDelivery::Request(request)) => *request,
+        Err(reason) => return rejected(reason),
     };
-    if envelope.get("interface_major") != Some(&json!(1))
-        || envelope.get("interface_minor") != Some(&json!(0))
-    {
-        return rejected("invalid_request");
-    }
-    if envelope.get("method") == Some(&json!("lifecycle_status")) {
-        return json!({"status":"recovery_required", "reason":"unknown_receipt"});
-    }
-    let expected = match envelope.get("method").and_then(Value::as_str) {
-        Some("resource_plan") => ProviderOperation::ResourcePlan,
-        Some("lifecycle_callback") => ProviderOperation::LifecycleCallback,
-        _ => return rejected("unknown_method"),
-    };
-    let Some(arguments) = envelope.get("arguments") else {
-        return rejected("invalid_request");
-    };
-    let Ok(request) = serde_json::from_value::<ProviderRequest>(arguments.clone()) else {
-        return rejected("invalid_request");
-    };
-    if request.operation != expected || extension_api::validate_provider_request(&request).is_err()
-    {
-        return rejected("invalid_request");
-    }
     if crate::settings_descriptor::validate(&request.settings).is_err() {
         return rejected("invalid_settings");
     }
@@ -225,34 +130,7 @@ pub(crate) fn handle(caller: &str, selected: &Selection, payload: Value) -> Valu
 /// the provider translates its own settings into a transport-neutral intent.
 pub(crate) fn intent_registration() -> Command {
     Command::RegisterApi {
-        method: ApiMethod {
-            service: crate::settings_descriptor::SERVICE.into(),
-            method: "processing_intent".into(),
-            interface_major: 1,
-            interface_minor: 1,
-            request: schema(
-                &[
-                    ("target", Kind::Object),
-                    ("revision", Kind::String),
-                    ("settings", Kind::Object),
-                ],
-                &[("output_hdr", Kind::Boolean)],
-            ),
-            response: schema(
-                &[("status", Kind::String)],
-                &[
-                    ("reason", Kind::String),
-                    ("target", Kind::Object),
-                    ("revision", Kind::String),
-                    ("enabled", Kind::Boolean),
-                    ("source_hdr_required", Kind::Any),
-                    ("output_hdr_required", Kind::Any),
-                    ("processor_settings", Kind::Object),
-                    ("processor_service", Kind::String),
-                ],
-            ),
-            privilege: ApiPrivilege::User,
-        },
+        method: processing_provider::processing_intent_method(crate::settings_descriptor::SERVICE),
     }
 }
 
@@ -261,55 +139,23 @@ pub(crate) fn intent(caller: &str, allowed: &[String], payload: Value) -> Value 
     if !allowed.iter().any(|principal| principal == caller) {
         return reject("unauthorized_caller");
     }
-    let Some(envelope) = payload.as_object().filter(|object| object.len() == 4) else {
-        return reject("invalid_request");
+    let intent = match processing_provider::decode_processing_intent(&payload) {
+        Ok(intent) => intent,
+        Err(reason) => return reject(reason),
     };
-    if envelope.get("method") != Some(&json!("processing_intent"))
-        || envelope.get("interface_major") != Some(&json!(1))
-        || envelope.get("interface_minor") != Some(&json!(1))
-    {
-        return reject("invalid_request");
-    }
-    let Some(args) = envelope
-        .get("arguments")
-        .and_then(Value::as_object)
-        .filter(|object| {
-            object.len() == 3
-                || (object.len() == 4 && object.get("output_hdr").is_some_and(Value::is_boolean))
-        })
-    else {
-        return reject("invalid_request");
-    };
-    let Some(target) = args.get("target") else {
-        return reject("invalid_request");
-    };
-    if serde_json::from_value::<extension_api::LifecycleTarget>(target.clone()).is_err() {
-        return reject("invalid_target");
-    }
-    let Some(revision) = args
-        .get("revision")
-        .and_then(Value::as_str)
-        .filter(|revision| {
-            !revision.is_empty() && revision.len() <= 128 && !revision.chars().any(char::is_control)
-        })
-    else {
-        return reject("invalid_revision");
-    };
-    let Some(settings) = args.get("settings") else {
-        return reject("invalid_settings");
-    };
-    let Ok(values) = serde_json::from_value(settings.clone()) else {
+    let Ok(values) = serde_json::from_value(intent.settings.clone()) else {
         return reject("invalid_settings");
     };
     if crate::settings_descriptor::validate(&values).is_err() {
         return reject("invalid_settings");
     }
-    let prepared = prepares_conversion(settings, args.get("output_hdr").and_then(Value::as_bool));
-    let mut processor_settings = settings.clone();
+    let prepared = prepares_conversion(&intent.settings, intent.output_hdr);
+    let target = json!(intent.target);
+    let mut processor_settings = intent.settings;
     if let Some(object) = processor_settings.as_object_mut() {
         object.insert("foreground_target".into(), target.clone());
     }
-    json!({"status":"succeeded", "target":target, "revision":revision,
+    json!({"status":"succeeded", "target":target, "revision":intent.revision,
         "enabled":prepared,
         "source_hdr_required":if prepared { Some(false) } else { None },
         "output_hdr_required":if prepared { Some(true) } else { None },
