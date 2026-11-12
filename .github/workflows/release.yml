@@ -1,6 +1,6 @@
 name: Release
 
-# Pushing a tag such as v0.2.0 builds this module for each shipped platform,
+# Pushing a tag such as v0.2.0 builds this module for Linux,
 # records where the libraries were built, and publishes them as a release.
 # The tag must equal the version in the module's Cargo manifests.
 
@@ -17,10 +17,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # RTX HDR conversion exists only on Linux hosts.
           - os: ubuntu-latest
             target: linux-x86_64
-          - os: windows-latest
-            target: windows-x86_64
     runs-on: ${{ matrix.os }}
     permissions:
       contents: read

@@ -249,7 +249,7 @@ refresh it with `python3 scripts/build-native.py .sdk --update-lock`.
 
 Continuous integration runs the same four commands on Linux, Windows and
 macOS. Pushing a tag `vX.Y.Z` that matches the version in `Cargo.toml` builds
-the Linux and Windows libraries, attests where they were built, and publishes
-them as a GitHub release. This crate takes its version from the workspace it
+the Linux library, attests where it was built, and publishes it as a GitHub
+release. This crate takes its version from the workspace it
 builds in, so the tag has to match the SDK's workspace version. A host installs this module as part of the signed
 Amaterasu module set; a release here is not an installable package on its own.
