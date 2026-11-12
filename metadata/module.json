@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "family": "rtx-hdr",
+  "repository": "https://github.com/nonary-streams/amaterasu-rtx-hdr",
+  "mount": "modules/rtx-hdr",
+  "components": [
+    {
+      "id": "amaterasu.rtx-hdr",
+      "package": "amaterasu-rtx-hdr",
+      "path": ".",
+      "name": "RTX HDR",
+      "summary": "Converts SDR streams to HDR with NVIDIA RTX."
+    }
+  ]
+}
