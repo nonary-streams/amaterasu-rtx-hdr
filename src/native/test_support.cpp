@@ -115,6 +115,41 @@ extern "C" int am_rtx_test_read_cuda(void *raw, uint64_t pointer, uint32_t pitch
         return -1;
     }
 }
+// Reads a published DMA-BUF as an independent consumer would: import it into
+// another context, wait on its acquire fence on the GPU, and read the packed
+// 10-bit words, whatever tiled modifier the producer negotiated.
+extern "C" int am_rtx_test_read_dmabuf(void *raw, const AmaterasuDmaBufFrame *frame,
+                                       uint32_t *pixels, size_t length) {
+    auto &session = *static_cast<rtx::Session *>(raw);
+    if (length != static_cast<size_t>(frame->width) * frame->height)
+        return -1;
+    try {
+        rtx::Current current(*session.api, session.surface, session.context);
+        session.surface.wait_acquire(frame->planes[0].acquire_fence_fd);
+        EGLImageKHR image = session.surface.import(*frame);
+        GLuint texture = 0, fbo = 0;
+        glGenTextures(1, &texture);
+        glBindTexture(GL_TEXTURE_2D, texture);
+        session.surface.bind_image(GL_TEXTURE_2D, image);
+        glGenFramebuffers(1, &fbo);
+        glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture, 0);
+        const bool complete = glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+        if (complete) {
+            glPixelStorei(GL_PACK_ALIGNMENT, 4);
+            glReadPixels(0, 0, frame->width, frame->height, GL_RGBA,
+                         GL_UNSIGNED_INT_2_10_10_10_REV, pixels);
+        }
+        glFinish();
+        const bool ok = complete && glGetError() == GL_NO_ERROR;
+        glDeleteFramebuffers(1, &fbo);
+        glDeleteTextures(1, &texture);
+        session.surface.destroy_image(session.surface.display, image);
+        return ok ? 0 : -1;
+    } catch (...) {
+        return -1;
+    }
+}
 extern "C" int am_rtx_test_fence(void *raw) {
     auto &session = *static_cast<rtx::Session *>(raw);
     try {

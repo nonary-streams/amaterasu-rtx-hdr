@@ -36,6 +36,7 @@ fn main() {
         .include("../../sdk/include")
         .file("src/native/runtime.cpp")
         .file("src/native/surface.cpp")
+        .file("src/native/dmabuf_output.cpp")
         .file("src/native/effect.cpp")
         .file("src/native/timing.cpp")
         .file("src/native/cuda_output.cpp")

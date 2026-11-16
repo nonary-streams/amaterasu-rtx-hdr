@@ -209,6 +209,7 @@ extern "C" void am_rtx_cuda_output_close(void *context, void *raw) {
         // Queued writes into this slot must finish before its memory is freed.
         if (session.api->synchronize_stream(session.stream) != CUDA_SUCCESS)
             std::abort();
+        rtx::release_dmabuf(session.surface, *output);
         session.api->destroy_event(output->ready);
         session.api->free_memory(output->pixels);
     } catch (...) {

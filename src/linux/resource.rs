@@ -1,7 +1,10 @@
-//! CUDA output for the canonical frame processor. The converted frame stays in a
-//! CUDA slot of the device's primary context, ordered for the consumer by the
-//! slot's event, so neither a GL output draw nor a sync_file handoff follows
-//! the model. A slot is rewritten only once every frame reference is released.
+//! Resource outputs for the canonical frame processor. The converted frame is
+//! produced in a CUDA slot of the device's primary context. A consumer that
+//! negotiates the CUDA offer reads that memory, ordered by the slot's event. A
+//! consumer that imports DMA-BUF negotiates one of the XB30 offers instead; the
+//! slot then publishes each frame into its exported buffer and hands the native
+//! fence as the plane's acquire fence. A slot is rewritten only once every
+//! frame reference is released.
 use super::{
     NativeSession, PendingInput, ReadCompletion, Stream, backend_failure,
     input::{InputFrame, Storage},
@@ -104,6 +107,31 @@ unsafe extern "C" {
         capacity: usize,
     ) -> i32;
     fn am_rtx_cuda_output_ready(context: *mut c_void, output: *mut c_void) -> i32;
+    fn am_rtx_dmabuf_modifiers(
+        root: *const c_char,
+        device: i32,
+        fourcc: u32,
+        modifiers: *mut u64,
+        capacity: usize,
+        count: *mut usize,
+        error: *mut c_char,
+        error_capacity: usize,
+    ) -> i32;
+    fn am_rtx_cuda_output_attach_dmabuf(
+        context: *mut c_void,
+        output: *mut c_void,
+        modifier: u64,
+        frame: *mut DmaBufFrame,
+        error: *mut c_char,
+        capacity: usize,
+    ) -> i32;
+    fn am_rtx_publish_dmabuf(
+        context: *mut c_void,
+        output: *mut c_void,
+        fence: *mut i32,
+        error: *mut c_char,
+        capacity: usize,
+    ) -> i32;
     fn am_rtx_process_cuda(
         context: *mut c_void,
         frame: *const DmaBufFrame,
@@ -114,9 +142,54 @@ unsafe extern "C" {
     ) -> i32;
 }
 
-/// The single output offer: a stream's offers never change once enumerated.
+/// A stream's offers never change once enumerated. The CUDA offer comes
+/// first; DMA-BUF offers follow, one per renderable modifier.
 const GENERATION: u64 = 1;
-const OFFER: u64 = 1;
+const CUDA_OFFER: u64 = 1;
+const FIRST_DMABUF_OFFER: u64 = 2;
+/// Bounded so a driver's modifier list cannot grow the offer set unboundedly.
+const MAX_DMABUF_OFFERS: usize = 16;
+/// DRM_FORMAT_XBGR2101010: the CUDA slot's packed X2B10G10R10 words.
+const XB30: u32 = u32::from_le_bytes(*b"XB30");
+
+/// Where a stream's converted frames are delivered.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum OutputTarget {
+    Cuda,
+    DmaBuf { modifier: u64 },
+}
+
+/// The modifiers this GPU can render XB30 into. An empty list leaves the
+/// processor with only its CUDA offer; it never substitutes another format.
+pub(super) fn dmabuf_modifiers(
+    settings: &Settings,
+    logger: Option<&amaterasu_module_sdk::LogEmitter>,
+) -> Vec<u64> {
+    let Ok(root) = CString::new(settings.runtime_directory.as_os_str().as_bytes()) else {
+        return Vec::new();
+    };
+    let mut modifiers = [0u64; MAX_DMABUF_OFFERS];
+    let mut count = 0usize;
+    let mut error = [0; 512];
+    // SAFETY: the path, modifier array, count and error buffer are live.
+    let result = unsafe {
+        am_rtx_dmabuf_modifiers(
+            root.as_ptr(),
+            settings.device as i32,
+            XB30,
+            modifiers.as_mut_ptr(),
+            modifiers.len(),
+            &mut count,
+            error.as_mut_ptr(),
+            error.len(),
+        )
+    };
+    if result != 0 {
+        let _ = backend_failure(&error, logger);
+        return Vec::new();
+    }
+    modifiers[..count.min(MAX_DMABUF_OFFERS)].to_vec()
+}
 
 pub(super) fn device_uuid(
     settings: &Settings,
@@ -145,10 +218,12 @@ pub(super) fn device_uuid(
     Ok(uuid)
 }
 
-/// A stream's CUDA output offer, kept at a stable address while enumerated.
+/// A stream's output offers, kept at a stable address while enumerated.
 pub(super) struct ResourceOutput {
     payload: Box<(CudaDeviceCapabilities, CudaEventCapabilities)>,
-    selected: bool,
+    /// Never resized after construction, so offered descriptors stay valid.
+    dmabuf: Box<[DmaBufResourceCapabilities]>,
+    selected: Option<u64>,
 }
 
 const NONE: FrameDescriptor = FrameDescriptor {
@@ -161,7 +236,7 @@ const NONE: FrameDescriptor = FrameDescriptor {
 };
 
 impl ResourceOutput {
-    pub(super) fn new(device_uuid: [u8; 16]) -> Self {
+    pub(super) fn new(device_uuid: [u8; 16], modifiers: &[u64]) -> Self {
         Self {
             payload: Box::new((
                 CudaDeviceCapabilities {
@@ -175,7 +250,21 @@ impl ResourceOutput {
                 },
                 CudaEventCapabilities { device_uuid },
             )),
-            selected: false,
+            dmabuf: modifiers
+                .iter()
+                .take(MAX_DMABUF_OFFERS)
+                .map(|&modifier| DmaBufResourceCapabilities {
+                    fourcc: XB30,
+                    color: DMABUF_COLOR_BT2020_PQ,
+                    modifier,
+                    min_width: 16,
+                    max_width: 8192,
+                    min_height: 16,
+                    max_height: 8192,
+                    device_id: device_uuid,
+                })
+                .collect(),
+            selected: None,
         }
     }
 
@@ -183,33 +272,72 @@ impl ResourceOutput {
         GENERATION
     }
 
-    /// The offer's descriptors point into this record, which the processor
+    /// The offers' descriptors point into this record, which the processor
     /// keeps until the stream is cancelled.
-    pub(super) fn offer(&self) -> CaptureResourceOffer {
-        CaptureResourceOffer {
-            id: OFFER,
+    pub(super) fn offers(&self) -> Vec<CaptureResourceOffer> {
+        let mut offers = vec![CaptureResourceOffer {
+            id: CUDA_OFFER,
             ownership: FRAME_OWNERSHIP_RETAINABLE,
             accessibility: FRAME_ACCESS_GPU,
             reserved: 0,
             resource: cuda_descriptor(FRAME_RESOURCE_CUDA_DEVICE, &self.payload.0),
             acquire_sync: cuda_descriptor(FRAME_SYNC_CUDA_EVENT, &self.payload.1),
             completion_sync: NONE,
-        }
+        }];
+        offers.extend(
+            self.dmabuf
+                .iter()
+                .zip(FIRST_DMABUF_OFFER..)
+                .map(|(caps, id)| {
+                    CaptureResourceOffer {
+                        id,
+                        ownership: FRAME_OWNERSHIP_RETAINABLE,
+                        accessibility: FRAME_ACCESS_GPU,
+                        reserved: 0,
+                        resource: FrameDescriptor {
+                            kind: FRAME_RESOURCE_DMABUF,
+                            version: 1,
+                            size: std::mem::size_of::<DmaBufResourceCapabilities>() as u32,
+                            reserved: 0,
+                            namespace: [0; 16],
+                            data: std::ptr::from_ref(caps).cast(),
+                        },
+                        // The fence travels in the frame's plane, not as a sync object.
+                        acquire_sync: NONE,
+                        completion_sync: NONE,
+                    }
+                }),
+        );
+        offers
     }
 
     pub(super) fn select(&mut self, generation: u64, offer: u64) -> Result<(), Status> {
-        if generation != GENERATION || offer != OFFER {
+        if generation != GENERATION || self.target(offer).is_none() {
             return Err(MEDIA_UNSUPPORTED);
         }
-        self.selected = true;
+        self.selected = Some(offer);
         Ok(())
     }
 
-    pub(super) fn selection(&self) -> Option<FrameResourceSelection> {
-        self.selected.then_some(FrameResourceSelection {
-            generation: GENERATION,
-            offer: OFFER,
+    fn target(&self, offer: u64) -> Option<OutputTarget> {
+        if offer == CUDA_OFFER {
+            return Some(OutputTarget::Cuda);
+        }
+        let index = usize::try_from(offer.checked_sub(FIRST_DMABUF_OFFER)?).ok()?;
+        self.dmabuf.get(index).map(|caps| OutputTarget::DmaBuf {
+            modifier: caps.modifier,
         })
+    }
+
+    pub(super) fn selection(&self) -> Option<(FrameResourceSelection, OutputTarget)> {
+        let offer = self.selected?;
+        Some((
+            FrameResourceSelection {
+                generation: GENERATION,
+                offer,
+            },
+            self.target(offer)?,
+        ))
     }
 }
 
@@ -220,6 +348,9 @@ pub(super) struct CudaSlot {
     output: NonNull<c_void>,
     frame: CudaDeviceFrame,
     ready: CudaEventSync,
+    /// The exported buffer of a DMA-BUF slot. Its plane fds are owned by the
+    /// native slot; the fence and presentation change only while unreferenced.
+    dmabuf: Option<Box<Cell<DmaBufFrame>>>,
     references: Cell<u32>,
     input_references: Cell<u32>,
     /// A consumer released with an unknown completion object: never reuse.
@@ -233,6 +364,7 @@ impl CudaSlot {
         device_uuid: [u8; 16],
         width: u32,
         height: u32,
+        target: OutputTarget,
         logger: Option<&amaterasu_module_sdk::LogEmitter>,
     ) -> Result<Self, Status> {
         let mut pixels = 0u64;
@@ -261,7 +393,7 @@ impl CudaSlot {
             unsafe { am_rtx_cuda_output_close(session.0.as_ptr(), output.as_ptr()) };
             return Err(status);
         }
-        Ok(Self {
+        let mut slot = Self {
             session: session.clone(),
             output,
             frame: CudaDeviceFrame {
@@ -273,10 +405,95 @@ impl CudaSlot {
                 height,
             },
             ready: CudaEventSync { event: ready },
+            dmabuf: None,
             references: Cell::new(0),
             input_references: Cell::new(0),
             quarantined: Cell::new(false),
             allocated_bytes,
+        };
+        if let OutputTarget::DmaBuf { modifier } = target {
+            let mut frame = DmaBufFrame {
+                width: 0,
+                height: 0,
+                fourcc: 0,
+                plane_count: 0,
+                modifier: 0,
+                planes: [DmaBufPlane::UNUSED; DMABUF_MAX_PLANES],
+                color: 0,
+                reserved: 0,
+                timestamp_us: 0,
+                sequence: 0,
+            };
+            // SAFETY: the slot's native output is live and unexposed; the
+            // frame out-pointer and error buffer are writable for the call.
+            let result = unsafe {
+                am_rtx_cuda_output_attach_dmabuf(
+                    session.0.as_ptr(),
+                    slot.output.as_ptr(),
+                    modifier,
+                    &mut frame,
+                    error.as_mut_ptr(),
+                    error.len(),
+                )
+            };
+            if result != 0 {
+                // Dropping the slot closes the native output and its budget.
+                return Err(backend_failure(&error, logger));
+            }
+            slot.dmabuf = Some(Box::new(Cell::new(frame)));
+        }
+        Ok(slot)
+    }
+
+    fn target(&self) -> OutputTarget {
+        match &self.dmabuf {
+            None => OutputTarget::Cuda,
+            Some(frame) => OutputTarget::DmaBuf {
+                modifier: frame.get().modifier,
+            },
+        }
+    }
+
+    /// Publish the slot's freshly converted CUDA frame into its DMA-BUF and
+    /// stamp it with the input's presentation. Only an unreferenced slot is
+    /// published, so no reader observes the change.
+    fn publish(
+        &self,
+        input: &CaptureResourceFrame,
+        logger: Option<&amaterasu_module_sdk::LogEmitter>,
+    ) -> Result<(), Status> {
+        let Some(cell) = &self.dmabuf else {
+            return Ok(());
+        };
+        debug_assert!(self.references.get() == 0);
+        let mut fence = -1;
+        let mut error = [0; 512];
+        // SAFETY: the session and slot are live, and the slot is unreferenced.
+        let result = unsafe {
+            am_rtx_publish_dmabuf(
+                self.session.0.as_ptr(),
+                self.output.as_ptr(),
+                &mut fence,
+                error.as_mut_ptr(),
+                error.len(),
+            )
+        };
+        if result != 0 {
+            return Err(backend_failure(&error, logger));
+        }
+        let mut frame = cell.get();
+        frame.planes[0].acquire_fence_fd = fence;
+        frame.timestamp_us = input.timestamp_us;
+        frame.sequence = input.sequence;
+        cell.set(frame);
+        Ok(())
+    }
+
+    /// Whether a cached delivery of this slot still describes `input`.
+    fn presents(&self, input: &CaptureResourceFrame) -> bool {
+        self.dmabuf.as_ref().is_none_or(|cell| {
+            let frame = cell.get();
+            frame.timestamp_us == input.timestamp_us && frame.sequence == input.sequence
         })
     }
 
@@ -342,8 +559,21 @@ impl CudaSlot {
             },
             clock: input.clock,
             pacing_clock: input.pacing_clock,
-            resource: cuda_descriptor(FRAME_RESOURCE_CUDA_DEVICE, &self.frame),
-            acquire_sync: cuda_descriptor(FRAME_SYNC_CUDA_EVENT, &self.ready),
+            resource: match &self.dmabuf {
+                None => cuda_descriptor(FRAME_RESOURCE_CUDA_DEVICE, &self.frame),
+                Some(cell) => FrameDescriptor {
+                    kind: FRAME_RESOURCE_DMABUF,
+                    version: 1,
+                    size: std::mem::size_of::<DmaBufFrame>() as u32,
+                    reserved: 0,
+                    namespace: [0; 16],
+                    data: cell.as_ptr().cast_const().cast(),
+                },
+            },
+            acquire_sync: match &self.dmabuf {
+                None => cuda_descriptor(FRAME_SYNC_CUDA_EVENT, &self.ready),
+                Some(_) => NONE,
+            },
             context: Rc::as_ptr(self).cast_mut().cast(),
             retain: retain_slot,
             release: release_slot,
@@ -432,7 +662,7 @@ impl Stream {
     pub(super) fn process_resource(
         &mut self,
         source: &InputFrame<'_>,
-        handoff: FrameResourceSelection,
+        (handoff, target): (FrameResourceSelection, OutputTarget),
         output_buffers: usize,
         device_uuid: [u8; 16],
         logger: Option<&amaterasu_module_sdk::LogEmitter>,
@@ -446,6 +676,8 @@ impl Stream {
         if source.freshness() == CAPTURE_FRAME_CACHED_REUSE
             && let Some(cached) = self.cached_resource.as_ref()
             && cached.input_sequence == input.sequence
+            && cached.slot.target() == target
+            && cached.slot.presents(input)
         {
             return cached.slot.deliver(handoff, input, source.freshness());
         }
@@ -454,7 +686,7 @@ impl Stream {
         }
         let admission = OutputAdmission::new()?;
         self.cached_resource = None;
-        self.open_cuda_slots(output_buffers, device_uuid, logger)?;
+        self.open_cuda_slots(output_buffers, device_uuid, target, logger)?;
         let slot = self
             .cuda_slots
             .iter()
@@ -494,6 +726,7 @@ impl Stream {
             unsafe { retained.release_completed() };
             return Err(backend_failure(&error, logger));
         }
+        let published = slot.publish(input, logger);
         let completion = match &source.storage {
             Storage::DmaBuf(_) if fence >= 0 => {
                 ReadCompletion::Fence(unsafe { OwnedFd::from_raw_fd(fence) })
@@ -513,6 +746,9 @@ impl Stream {
             input: Some(retained),
             completion,
         }));
+        // The input's completion is queued either way; a failed publication
+        // retired its own GPU work and leaves the slot unreferenced.
+        published?;
         self.cached_resource = Some(CachedResource {
             slot: slot.clone(),
             input_sequence: input.sequence,
@@ -525,11 +761,22 @@ impl Stream {
         &mut self,
         count: usize,
         device_uuid: [u8; 16],
+        target: OutputTarget,
         logger: Option<&amaterasu_module_sdk::LogEmitter>,
     ) -> Result<(), Status> {
-        if !self.cuda_slots.is_empty() {
+        if self
+            .cuda_slots
+            .first()
+            .is_some_and(|slot| slot.target() == target)
+        {
             return Ok(());
         }
+        // A renegotiated consumer selected another output. Slots still read by
+        // the previous consumer stay with their readers until released.
+        if self.cuda_slots.iter().any(|slot| slot.is_referenced()) {
+            return Err(MEDIA_BUSY);
+        }
+        self.cuda_slots.clear();
         let session = self.session.clone();
         let mut slots = Vec::with_capacity(count);
         for _ in 0..count {
@@ -538,6 +785,7 @@ impl Stream {
                 device_uuid,
                 self.width,
                 self.height,
+                target,
                 logger,
             )?));
         }

@@ -152,14 +152,34 @@ struct Current {
 };
 
 /* One CUDA output slot: pitch-linear X2B10G10R10 memory in the primary
- * context and the event recorded after each write into it. */
+ * context and the event recorded after each write into it. A slot negotiated
+ * as DMA-BUF also owns an exported XB30 buffer that each frame is published
+ * into, with the native fence that orders that publication for its reader. */
+struct DmaBufTarget {
+    gbm_bo *buffer = nullptr;
+    EGLImageKHR image = EGL_NO_IMAGE_KHR;
+    GLuint texture = 0, fbo = 0;
+    AmaterasuDmaBufFrame frame{};
+    int fence = -1;
+};
 struct CudaOutput {
     CUdeviceptr pixels = 0;
     size_t pitch = 0;
     CUevent ready = nullptr;
+    std::unique_ptr<DmaBufTarget> dmabuf;
+};
+
+/* Session-wide staging for DMA-BUF publication. CUDA/GL interop does not
+ * register packed GL_RGB10_A2, so the packed words cross through R32UI and a
+ * GL pass stores them unchanged into the exported 10-bit surface. */
+struct DmaBufPublisher {
+    GLuint staging = 0, program = 0;
+    CUgraphicsResource resource = nullptr;
+    uint32_t width = 0, height = 0;
 };
 
 void copy_graphics_input(Api &, CUstream, CUgraphicsResource, Image &);
+void release_dmabuf(Surface &, CudaOutput &);
 
 struct Session {
     std::shared_ptr<Api> api;
@@ -174,6 +194,10 @@ struct Session {
     Timing timing;
     CUmodule kernels = nullptr;
     CUfunction pq_output = nullptr, sdr_output = nullptr, cpu_input = nullptr;
+    DmaBufPublisher publisher;
+    void attach_dmabuf(CudaOutput &output, uint64_t modifier);
+    int publish_dmabuf(CudaOutput &output);
+    void close_publisher();
     CUdeviceptr upload = 0;
     size_t upload_pitch = 0, upload_rows = 0;
     void upload_cpu(const AmaterasuCpuFrame &frame, const AmaterasuFrameColorMetadata &color);
@@ -206,4 +230,7 @@ int am_rtx_device_uuid(const char *, int, uint8_t *, char *, size_t);
 void *am_rtx_cuda_output_open(void *, uint64_t *, uint32_t *, void **, char *, size_t);
 void am_rtx_cuda_output_close(void *, void *);
 int am_rtx_process_cuda(void *, const AmaterasuDmaBufFrame *, void *, int *, char *, size_t);
+int am_rtx_dmabuf_modifiers(const char *, int, uint32_t, uint64_t *, size_t, size_t *, char *, size_t);
+int am_rtx_cuda_output_attach_dmabuf(void *, void *, uint64_t, AmaterasuDmaBufFrame *, char *, size_t);
+int am_rtx_publish_dmabuf(void *, void *, int *, char *, size_t);
 }

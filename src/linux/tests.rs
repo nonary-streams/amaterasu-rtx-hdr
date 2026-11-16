@@ -309,6 +309,12 @@ unsafe extern "C" {
         format: u32,
     ) -> *mut c_void;
     fn am_rtx_test_source_close(context: *mut c_void, source: *mut c_void);
+    fn am_rtx_test_read_dmabuf(
+        context: *mut c_void,
+        frame: *const DmaBufFrame,
+        pixels: *mut u32,
+        length: usize,
+    ) -> i32;
     fn am_rtx_test_read_cuda(
         context: *mut c_void,
         pointer: u64,
@@ -468,6 +474,15 @@ impl Binding {
         b
     }
     fn negotiate(&self, source: &CaptureResourceOffer) {
+        self.negotiate_output(source, |_| true);
+    }
+    /// Negotiates the input, then selects the first output offer accepted by
+    /// `consumer`, as a downstream consumer's configure would.
+    fn negotiate_output(
+        &self,
+        source: &CaptureResourceOffer,
+        consumer: impl Fn(&CaptureResourceOffer) -> bool,
+    ) {
         let api = self.api();
         let context = api.base.base.base.context;
         let mut inputs = Vec::<u64>::new();
@@ -493,7 +508,14 @@ impl Binding {
         assert!(inputs.into_iter().any(|id| unsafe {
             (api.base.base.configure)(context, 77, generation, id, 1, source)
         } == STATUS_OK));
-        let mut outputs = Vec::<u64>::new();
+        let mut outputs = Vec::<CaptureResourceOffer>::new();
+        unsafe extern "C" fn collect_offer(
+            c: *mut c_void,
+            o: *const CaptureResourceOffer,
+        ) -> Status {
+            unsafe { &mut *c.cast::<Vec<CaptureResourceOffer>>() }.push(unsafe { *o });
+            STATUS_OK
+        }
         assert_eq!(
             unsafe {
                 (api.base.enumerate_outputs)(
@@ -501,15 +523,19 @@ impl Binding {
                     77,
                     CaptureResourceOfferSink {
                         context: std::ptr::from_mut(&mut outputs).cast(),
-                        write: collect,
+                        write: collect_offer,
                     },
                     &mut generation,
                 )
             },
             STATUS_OK
         );
+        let selected = outputs
+            .iter()
+            .find(|offer| consumer(offer))
+            .expect("an output offer the consumer accepts");
         assert_eq!(
-            unsafe { (api.base.select_output)(context, 77, generation, outputs[0]) },
+            unsafe { (api.base.select_output)(context, 77, generation, selected.id) },
             STATUS_OK
         );
     }
@@ -582,6 +608,116 @@ fn read(session: &NativeSession, frame: &CaptureResourceFrame) -> Vec<u32> {
 unsafe fn release(frame: CaptureResourceFrame) {
     unsafe { (frame.release)(frame.context, &NONE) };
 }
+#[test]
+fn outputs_offer_cuda_first_then_one_xb30_dmabuf_per_renderable_modifier() {
+    const TILED: u64 = 0x0300_0000_0060_6014;
+    let mut output = resource::ResourceOutput::new([7; 16], &[0, TILED]);
+    let offers = output.offers();
+    assert_eq!(offers.len(), 3);
+    assert_eq!(offers[0].resource.kind, FRAME_RESOURCE_CUDA_DEVICE);
+    for (offer, modifier) in offers[1..].iter().zip([0, TILED]) {
+        assert_eq!(offer.resource.kind, FRAME_RESOURCE_DMABUF);
+        assert_eq!(offer.ownership, FRAME_OWNERSHIP_RETAINABLE);
+        assert_eq!(offer.acquire_sync.kind, FRAME_SYNC_NONE);
+        assert_eq!(offer.completion_sync.kind, FRAME_SYNC_NONE);
+        let caps = unsafe { *offer.resource.data.cast::<DmaBufResourceCapabilities>() };
+        assert_eq!(caps.fourcc, u32::from_le_bytes(*b"XB30"));
+        assert_eq!(caps.color, DMABUF_COLOR_BT2020_PQ);
+        assert_eq!((caps.modifier, caps.device_id), (modifier, [7; 16]));
+    }
+    assert_eq!(output.selection(), None);
+    output.select(1, offers[2].id).unwrap();
+    assert_eq!(
+        output.selection().unwrap().1,
+        resource::OutputTarget::DmaBuf { modifier: TILED }
+    );
+    output.select(1, 1).unwrap();
+    assert_eq!(output.selection().unwrap().1, resource::OutputTarget::Cuda);
+    assert_eq!(output.select(1, 4), Err(MEDIA_UNSUPPORTED));
+    assert_eq!(output.select(2, 1), Err(MEDIA_UNSUPPORTED));
+    // Without renderable modifiers the processor offers CUDA only.
+    assert_eq!(
+        resource::ResourceOutput::new([7; 16], &[]).offers().len(),
+        1
+    );
+}
+
+/// Reads a published frame through an independent GL import after its fence.
+fn read_dmabuf(session: &NativeSession, frame: &CaptureResourceFrame) -> Vec<u32> {
+    assert_eq!(frame.resource.kind, FRAME_RESOURCE_DMABUF);
+    assert_eq!(frame.acquire_sync.kind, FRAME_SYNC_NONE);
+    let dmabuf = unsafe { *frame.resource.data.cast::<DmaBufFrame>() };
+    assert_eq!(dmabuf.fourcc, u32::from_le_bytes(*b"XB30"));
+    assert_eq!(dmabuf.color, DMABUF_COLOR_BT2020_PQ);
+    assert_eq!(
+        (dmabuf.timestamp_us, dmabuf.sequence),
+        (frame.timestamp_us, frame.sequence)
+    );
+    let mut pixels = vec![0; dmabuf.width as usize * dmabuf.height as usize];
+    assert_eq!(
+        unsafe {
+            am_rtx_test_read_dmabuf(
+                session.0.as_ptr(),
+                &dmabuf,
+                pixels.as_mut_ptr(),
+                pixels.len(),
+            )
+        },
+        0
+    );
+    pixels
+}
+
+#[test]
+#[ignore = "requires NVIDIA RTX and AMATERASU_TRUEHDR_RUNTIME; run only with the stream idle"]
+fn nvidia_dmabuf_output_publishes_the_cuda_words_unchanged_for_dmabuf_consumers() {
+    let config = gpu_settings();
+    let fixture = Stream::open(&config, 512, 288, None).unwrap();
+    let source = Source::new(fixture.session.clone(), u32::from_le_bytes(*b"AB30"));
+    let (caps, mut offer) = source.offer();
+    offer.resource.data = std::ptr::from_ref(&caps).cast();
+    // An unchanged CUDA consumer and a DMA-BUF consumer of the same input.
+    let cuda = Binding::new(config.clone());
+    cuda.negotiate_output(&offer, |o| o.resource.kind == FRAME_RESOURCE_CUDA_DEVICE);
+    let expected_frame = cuda
+        .process(&source.resource(1, CAPTURE_FRAME_FRESH))
+        .unwrap();
+    let expected = read(&source.session, &expected_frame);
+    assert_ne!(
+        expected[0] & 0x3fff_ffff,
+        expected[511] & 0x3fff_ffff,
+        "non-trivial frame"
+    );
+    unsafe { release(expected_frame) };
+    let dmabuf = Binding::new(config);
+    dmabuf.negotiate_output(&offer, |o| o.resource.kind == FRAME_RESOURCE_DMABUF);
+    let published = dmabuf
+        .process(&source.resource(1, CAPTURE_FRAME_FRESH))
+        .unwrap();
+    let pixels = read_dmabuf(&source.session, &published);
+    assert_eq!(pixels.len(), expected.len());
+    let mismatched = pixels
+        .iter()
+        .zip(&expected)
+        .filter(|(a, b)| *a & 0x3fff_ffff != *b & 0x3fff_ffff)
+        .count();
+    assert_eq!(mismatched, 0, "published words differ from the CUDA output");
+    // The published buffer is immutable while referenced, like a CUDA slot.
+    assert!(matches!(
+        dmabuf.process(&source.resource(2, CAPTURE_FRAME_FRESH)),
+        Err(MEDIA_BUSY)
+    ));
+    unsafe { release(published) };
+    let cached = dmabuf
+        .process(&source.resource(1, CAPTURE_FRAME_CACHED_REUSE))
+        .unwrap();
+    assert_eq!(read_dmabuf(&source.session, &cached), pixels);
+    unsafe { release(cached) };
+    drop(dmabuf);
+    drop(cuda);
+    assert_eq!(source.references.get(), 0);
+}
+
 #[test]
 #[ignore = "requires NVIDIA RTX and AMATERASU_TRUEHDR_RUNTIME; run only with the stream idle"]
 fn nvidia_dma_inputs_produce_hdr_pixels_and_one_buffer_backpressure_without_copying_output() {
