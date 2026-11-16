@@ -6,9 +6,11 @@
 use amaterasu_module_sdk::{
     Command, ModuleResult,
     extension_api::{
-        self, ConsumerChange, LifecyclePhase, ProviderOperation, ProviderResponse, ResourcePlan,
+        self, ConsumerChange, LifecyclePhase, ProviderOperation, ProviderRequest, ProviderResponse,
+        ResourcePlan,
     },
     processing_provider::{self, LifecycleDelivery},
+    stream_lifecycle::{LifecycleLayer, StreamIssue, StreamIssueOutbox},
 };
 use serde_json::{Value, json};
 
@@ -45,7 +47,16 @@ pub(crate) fn registrations() -> Vec<Command> {
 
 /// Handle only synchronous, side-effect-free coordinator operations. Settings
 /// stay in the coordinator's revision-bound snapshot for the selected consumer.
-pub(crate) fn handle(caller: &str, selected: &Selection, payload: Value) -> Value {
+///
+/// A rejection of a decoded request, or RTX HDR left off for the stream, is
+/// queued on `issues` under the provider operation ID the coordinator bound
+/// to the stream. Requests that cannot be decoded name no stream.
+pub(crate) fn handle(
+    caller: &str,
+    selected: &Selection,
+    payload: Value,
+    issues: &mut StreamIssueOutbox,
+) -> Value {
     let rejected = |reason: &str| json!({"status":"rejected", "reason":reason});
     if caller != selected.principal {
         return rejected("unauthorized_caller");
@@ -57,17 +68,79 @@ pub(crate) fn handle(caller: &str, selected: &Selection, payload: Value) -> Valu
         Ok(LifecycleDelivery::Request(request)) => *request,
         Err(reason) => return rejected(reason),
     };
+    let response = respond(&request);
+    report_stream_issue(&request, &response, issues);
+    response
+}
+
+/// Queue what the launch owner should know about this reply. A rejected
+/// lifecycle request stops the transition; a plan that leaves conversion off
+/// although the user enabled it is a fallback the stream survives.
+fn report_stream_issue(
+    request: &ProviderRequest,
+    response: &Value,
+    issues: &mut StreamIssueOutbox,
+) {
+    let phase = operation_label(&request.operation);
+    let issue = if response["status"] == "rejected" {
+        let reason = response["reason"].as_str().unwrap_or("rejected");
+        StreamIssue::critical(
+            request.operation_id.clone(),
+            LifecycleLayer::RtxHdr,
+            phase,
+            "rtx_hdr_lifecycle_rejected",
+        )
+        .because(reason)
+    } else if request.operation == ProviderOperation::ResourcePlan
+        && request.intent != Some(extension_api::StreamIntent::Join)
+        && bypassed_for_sdr(request)
+    {
+        StreamIssue::demoted(
+            request.operation_id.clone(),
+            LifecycleLayer::RtxHdr,
+            phase,
+            "rtx_hdr_bypassed",
+            "rtx_hdr_off",
+        )
+        .because("sdr_output")
+    } else {
+        return;
+    };
+    eprintln!(
+        "RTX HDR stream issue operation={} phase={phase} code={}",
+        issue.operation, issue.code
+    );
+    issues.push(issue);
+}
+
+fn operation_label(operation: &ProviderOperation) -> &'static str {
+    match operation {
+        ProviderOperation::ResourcePlan => "resource_plan",
+        ProviderOperation::ResourceFinalizePlan => "resource_finalize_plan",
+        ProviderOperation::LifecycleCallback => "lifecycle_callback",
+    }
+}
+
+/// The user enabled conversion, but the stream's output is SDR.
+fn bypassed_for_sdr(request: &ProviderRequest) -> bool {
+    request.requested_video.as_ref().map(|video| video.hdr) == Some(false)
+        && conversion_enabled(&json!(request.settings))
+}
+
+/// The coordinator reply for a decoded request.
+fn respond(request: &ProviderRequest) -> Value {
+    let rejected = |reason: &str| json!({"status":"rejected", "reason":reason});
     if crate::settings_descriptor::validate(&request.settings).is_err() {
         return rejected("invalid_settings");
     }
     if request.intent == Some(extension_api::StreamIntent::Join) {
         let response = match request.operation {
             ProviderOperation::ResourcePlan => {
-                extension_api::stream_join_plan(&request, crate::settings_descriptor::PROVIDER)
+                extension_api::stream_join_plan(request, crate::settings_descriptor::PROVIDER)
                     .map(|plan| ProviderResponse::Planned { plan })
             }
             ProviderOperation::LifecycleCallback => {
-                extension_api::stream_join_callback(&request, crate::settings_descriptor::PROVIDER)
+                extension_api::stream_join_callback(request, crate::settings_descriptor::PROVIDER)
             }
             _ => Err("unsupported join operation".into()),
         };
@@ -120,7 +193,7 @@ pub(crate) fn handle(caller: &str, selected: &Selection, payload: Value) -> Valu
         },
         _ => return rejected("invalid_operation"),
     };
-    if extension_api::validate_provider_response(&request, &response).is_err() {
+    if extension_api::validate_provider_response(request, &response).is_err() {
         return rejected("invalid_admission");
     }
     serde_json::to_value(response).unwrap_or_else(|_| rejected("invalid_response"))
@@ -193,6 +266,102 @@ mod tests {
         }})
     }
 
+    fn handle_quietly(caller: &str, selected: &Selection, payload: Value) -> Value {
+        handle(caller, selected, payload, &mut StreamIssueOutbox::default())
+    }
+
+    fn coordinator() -> Selection {
+        selection(Some(
+            &amaterasu_module_sdk::processing_composition::CapabilityBinding {
+                principal: "coordinator".into(),
+                service: "lifecycle/1".into(),
+                contract: extension_api::SESSION_LIFECYCLE_SERVICE.into(),
+                interface_major: 1,
+                interface_minor: 0,
+            },
+        ))
+        .unwrap()
+        .unwrap()
+    }
+
+    fn published(issues: &mut StreamIssueOutbox) -> Vec<StreamIssue> {
+        let mut published = Vec::new();
+        issues
+            .flush_with(&mut |command| {
+                let Command::Publish { topic, payload } = command else {
+                    panic!("only stream reports are sent")
+                };
+                assert_eq!(topic, "amaterasu.stream.report/1");
+                assert_eq!(payload["kind"], "issue");
+                match serde_json::from_value(payload).unwrap() {
+                    amaterasu_module_sdk::stream_lifecycle::StreamReport::Issue(issue) => {
+                        published.push(issue)
+                    }
+                    other => panic!("unexpected report {other:?}"),
+                }
+                Ok(amaterasu_module_sdk::Response::Ok)
+            })
+            .unwrap();
+        published
+    }
+
+    fn default_settings() -> Value {
+        json!(
+            amaterasu_configuration_schema::defaults(&crate::settings_descriptor::definitions())
+                .unwrap()
+        )
+    }
+
+    #[test]
+    fn a_rejected_lifecycle_request_is_published_under_the_provider_operation() {
+        use amaterasu_module_sdk::stream_lifecycle::IssueDisposition;
+        let mut request = envelope("resource_plan", "resource_plan");
+        request["arguments"]["operation_id"] = json!("app-7-lifecycle.p3");
+        request["arguments"]["settings"] = json!({"rtx_hdr_peak_brightness": 2001});
+        let mut issues = StreamIssueOutbox::default();
+        let reply = handle("coordinator", &coordinator(), request, &mut issues);
+        assert_eq!(reply["status"], "rejected");
+        let published = published(&mut issues);
+        assert_eq!(published.len(), 1);
+        let issue = &published[0];
+        assert_eq!(issue.operation, "app-7-lifecycle.p3");
+        assert_eq!(issue.layer, LifecycleLayer::RtxHdr);
+        assert_eq!(issue.phase, "resource_plan");
+        assert_eq!(issue.code, "rtx_hdr_lifecycle_rejected");
+        assert_eq!(issue.reason, "invalid_settings");
+        assert_eq!(issue.disposition, IssueDisposition::CriticalFailure);
+        assert!(issue.caused_by.is_none());
+        assert!(issue.site.contains("lifecycle.rs:"), "{}", issue.site);
+    }
+
+    #[test]
+    fn sdr_output_demotes_enabled_conversion_and_a_plain_plan_reports_nothing() {
+        let mut request = envelope("resource_plan", "resource_plan");
+        request["arguments"]["settings"] = default_settings();
+        let mut issues = StreamIssueOutbox::default();
+        assert_eq!(
+            handle("coordinator", &coordinator(), request.clone(), &mut issues)["status"],
+            "planned"
+        );
+        assert!(issues.is_empty(), "conversion is off by the user's choice");
+        assert_eq!(
+            handle("other", &coordinator(), request.clone(), &mut issues)["reason"],
+            "unauthorized_caller"
+        );
+        assert!(issues.is_empty(), "an undecoded caller names no stream");
+
+        request["arguments"]["settings"]["rtx_hdr_application_enable"] = json!(true);
+        request["arguments"]["requested_video"] =
+            json!({"width":1920,"height":1080,"refresh_millihz":60000,"hdr":false});
+        handle("coordinator", &coordinator(), request, &mut issues);
+        let published = published(&mut issues);
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].operation, "operation");
+        assert_eq!(published[0].code, "rtx_hdr_bypassed");
+        assert_eq!(published[0].fallback.as_deref(), Some("rtx_hdr_off"));
+        assert_eq!(published[0].reason, "sdr_output");
+    }
+
     #[test]
     fn selected_coordinator_can_plan_without_acquiring_resources() {
         let selected = selection(Some(
@@ -212,16 +381,16 @@ mod tests {
                 .unwrap();
         request["arguments"]["settings"] = json!(settings);
         assert_eq!(
-            handle("other", &selected, request.clone())["reason"],
+            handle_quietly("other", &selected, request.clone())["reason"],
             "unauthorized_caller"
         );
-        let planned = handle("coordinator", &selected, request.clone());
+        let planned = handle_quietly("coordinator", &selected, request.clone());
         assert_eq!(planned["status"], "planned");
         assert_eq!(planned["plan"]["resources"], json!([]));
         assert!(planned["plan"]["constraints"]["processing_requirement"].is_null());
         let mut enabled_request = request.clone();
         enabled_request["arguments"]["settings"]["rtx_hdr_application_enable"] = json!(true);
-        let enabled_plan = handle("coordinator", &selected, enabled_request);
+        let enabled_plan = handle_quietly("coordinator", &selected, enabled_request);
         assert_eq!(
             enabled_plan["plan"]["constraints"]["processing_requirement"],
             json!({"source_hdr_required":false, "output_hdr_required":true})
@@ -230,7 +399,7 @@ mod tests {
         sdr_request["arguments"]["settings"]["rtx_hdr_application_enable"] = json!(true);
         sdr_request["arguments"]["requested_video"] =
             json!({"width":1920,"height":1080,"refresh_millihz":60000,"hdr":false});
-        let sdr_plan = handle("coordinator", &selected, sdr_request);
+        let sdr_plan = handle_quietly("coordinator", &selected, sdr_request);
         assert_eq!(sdr_plan["status"], "planned");
         assert!(sdr_plan["plan"]["constraints"]["processing_requirement"].is_null());
         let mut callback = envelope("lifecycle_callback", "lifecycle_callback");
@@ -239,12 +408,12 @@ mod tests {
         callback["arguments"]["plan_revision"] = json!(1);
         callback["arguments"]["admission_id"] = json!("admitted");
         assert_eq!(
-            handle("coordinator", &selected, callback.clone())["status"],
+            handle_quietly("coordinator", &selected, callback.clone())["status"],
             "prepared"
         );
         callback["arguments"]["plan_revision"] = json!(2);
         assert_eq!(
-            handle("coordinator", &selected, callback)["reason"],
+            handle_quietly("coordinator", &selected, callback)["reason"],
             "invalid_request"
         );
     }

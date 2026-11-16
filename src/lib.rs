@@ -53,6 +53,9 @@ pub struct RtxHdr {
     foreground: Option<foreground_coordinator::Coordinator>,
     #[cfg(all(target_os = "linux", feature = "linux-nvidia"))]
     display_adjustment: Option<display_adjustment::Coordinator>,
+    /// Lifecycle rejections and fallbacks, published from the tick.
+    #[cfg(all(target_os = "linux", feature = "linux-nvidia"))]
+    stream_issues: amaterasu_module_sdk::stream_lifecycle::StreamIssueOutbox,
 }
 
 impl ManagedModule for RtxHdr {
@@ -240,6 +243,7 @@ impl ManagedModule for RtxHdr {
                 processing_consumers,
                 foreground,
                 display_adjustment,
+                stream_issues: Default::default(),
             })
         }
         #[cfg(not(all(target_os = "linux", feature = "linux-nvidia")))]
@@ -266,6 +270,11 @@ impl ManagedModule for RtxHdr {
         #[cfg(all(target_os = "linux", feature = "linux-nvidia"))]
         {
             self.logs.flush(&self.runtime);
+            if !self.stream_issues.is_empty()
+                && let Err(error) = self.stream_issues.flush(&self.runtime)
+            {
+                eprintln!("RTX HDR stream issue report failed error={error}");
+            }
             if let Some(coordinator) = &mut self.display_adjustment {
                 coordinator.advance(&self.runtime);
             }
@@ -317,8 +326,12 @@ impl ManagedModule for RtxHdr {
                             _ => {
                                 match &self.lifecycle {
                                     Some(selected) => {
-                                        let response =
-                                            lifecycle::handle(&caller, selected, payload.clone());
+                                        let response = lifecycle::handle(
+                                            &caller,
+                                            selected,
+                                            payload.clone(),
+                                            &mut self.stream_issues,
+                                        );
                                         let request = payload.get("arguments").and_then(|arguments| serde_json::from_value::<amaterasu_module_sdk::extension_api::ProviderRequest>(arguments.clone()).ok());
                                         if response
                                             .get("status")

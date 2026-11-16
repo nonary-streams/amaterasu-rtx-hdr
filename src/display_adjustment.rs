@@ -2,6 +2,7 @@
 use amaterasu_module_sdk::{
     Command, Response, RuntimeClient,
     display_settings::{Adjustment, HdrMode, Operation, preparation::Context},
+    stream_lifecycle::{LifecycleLayer, StreamIssue, StreamIssueOutbox},
 };
 use serde_json::{Value, json};
 use std::{
@@ -16,6 +17,8 @@ enum Stage {
 }
 struct Pending {
     inbound: u64,
+    /// The display settings operation this preparation acquires under.
+    operation_id: String,
     context: Context,
     command: Command,
     deadline: Instant,
@@ -26,6 +29,8 @@ pub(crate) struct Coordinator {
     service: String,
     callers: Vec<String>,
     pending: VecDeque<Pending>,
+    /// Preparation failures, published from `advance`.
+    issues: StreamIssueOutbox,
 }
 impl Coordinator {
     pub fn new(service: String, callers: Vec<String>) -> Self {
@@ -33,6 +38,7 @@ impl Coordinator {
             service,
             callers,
             pending: VecDeque::new(),
+            issues: StreamIssueOutbox::default(),
         }
     }
     pub fn enqueue(
@@ -73,6 +79,12 @@ impl Coordinator {
             return Ok(Some(json!({"ok":true,"scope":context.display_scope})));
         }
         let operation_id = format!("rtx-source-{}", context.display_scope.id);
+        // The consumer that opened the scope bound its ID to the stream; this
+        // files the acquire's reports, here and in display settings, there.
+        self.issues.push_binding(amaterasu_module_sdk::stream_lifecycle::StreamBinding::new(
+            context.display_scope.id.clone(),
+            operation_id.clone(),
+        ));
         let command = Operation::Acquire {
             operation_id: operation_id.clone(),
             scope: context.display_scope.clone(),
@@ -88,6 +100,7 @@ impl Coordinator {
         })?;
         self.pending.push_back(Pending {
             inbound,
+            operation_id,
             context,
             command,
             deadline: Instant::now() + Duration::from_millis(remaining_ms.min(5000)),
@@ -98,6 +111,38 @@ impl Coordinator {
     }
     pub fn advance(&mut self, runtime: &RuntimeClient) {
         self.advance_with(&mut |command| runtime.send(command));
+        self.publish_issues(&mut |command| runtime.send(command));
+    }
+    /// Publish preparation failures on the launch owner's topic.
+    fn publish_issues(&mut self, send: &mut impl FnMut(Command) -> Result<Response, String>) {
+        if !self.issues.is_empty()
+            && let Err(error) = self.issues.flush_with(send)
+        {
+            eprintln!("RTX HDR stream issue report failed error={error}");
+        }
+    }
+    /// The display settings provider did not give this preparation its SDR
+    /// adjustment, so the source cannot be prepared. Cancellation by the
+    /// caller is the caller's to report.
+    #[track_caller]
+    fn report_adjustment_failure(&mut self, pending: &Pending, code: &str, reason: &str) {
+        if pending.cancelled {
+            return;
+        }
+        eprintln!(
+            "RTX HDR source preparation failed operation={} code={code} reason={reason}",
+            pending.operation_id
+        );
+        self.issues.push(
+            StreamIssue::critical(
+                pending.operation_id.clone(),
+                LifecycleLayer::RtxHdr,
+                "prepare_source",
+                code,
+            )
+            .because(reason)
+            .caused_by(LifecycleLayer::DisplaySettings),
+        );
     }
     fn advance_with(&mut self, send: &mut impl FnMut(Command) -> Result<Response, String>) {
         let Some(mut pending) = self.pending.pop_front() else {
@@ -134,7 +179,12 @@ impl Coordinator {
             }
             Stage::Submit => match send(pending.command.clone()) {
                 Ok(Response::Accepted { id }) => pending.stage = Stage::Wait(id),
-                Ok(Response::Error { .. }) => {
+                Ok(Response::Error { code, .. }) => {
+                    self.report_adjustment_failure(
+                        &pending,
+                        "display_adjustment_unavailable",
+                        reason_label(&code),
+                    );
                     finished = Some(json!({"ok":false,"code":"display_adjustment_unavailable"}))
                 }
                 _ => {}
@@ -150,6 +200,11 @@ impl Coordinator {
                     Ok(Response::Error { code, .. })
                         if code == "request_ended" || code == "not_found" =>
                     {
+                        self.report_adjustment_failure(
+                            &pending,
+                            "display_adjustment_cancelled",
+                            &code,
+                        );
                         finished = Some(json!({"ok":false,"code":"display_adjustment_cancelled"}))
                     }
                     _ => {}
@@ -166,6 +221,13 @@ impl Coordinator {
                             &pending.context.display_scope,
                         )
                         .is_ok();
+                    if !success {
+                        self.report_adjustment_failure(
+                            &pending,
+                            "display_adjustment_unconfirmed",
+                            reason_label(payload["code"].as_str().unwrap_or("lease_unconfirmed")),
+                        );
+                    }
                     finished = Some(if success {
                         json!({"ok":true,"scope":pending.context.display_scope})
                     } else {
@@ -182,6 +244,15 @@ impl Coordinator {
     pub fn is_idle(&self) -> bool {
         self.pending.is_empty()
     }
+}
+/// A provider or broker code as an issue reason; anything else is unnamed.
+fn reason_label(code: &str) -> &str {
+    let identifier = !code.is_empty()
+        && code.len() <= 64
+        && code
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':'));
+    if identifier { code } else { "unnamed" }
 }
 #[cfg(test)]
 mod tests {
@@ -264,6 +335,63 @@ mod tests {
             coordinator.advance_with(&mut send);
         }
         assert!(requested && finished && coordinator.is_idle());
+    }
+
+    #[test]
+    fn a_refused_adjustment_is_published_as_caused_by_display_settings() {
+        use amaterasu_module_sdk::stream_lifecycle::{IssueDisposition, StreamReport};
+        let mut coordinator =
+            Coordinator::new(display_settings::SERVICE.into(), vec!["host".into()]);
+        coordinator
+            .enqueue(
+                1,
+                "host",
+                display_settings::preparation::payload(&context()),
+                5000,
+            )
+            .unwrap();
+        let mut published = Vec::new();
+        let mut send = |command| {
+            Ok(match command {
+                Command::CheckRequest { .. } | Command::ReleaseResult { .. } => Response::Ok,
+                Command::CallApi { .. } => Response::Accepted { id: 2 },
+                Command::TakeResult { .. } => Response::Result {
+                    payload: json!({"ok":false,"code":"display_source_unavailable"}),
+                },
+                Command::Complete { payload, .. } => {
+                    assert_eq!(payload["code"], "display_adjustment_unconfirmed");
+                    Response::Ok
+                }
+                Command::Publish { topic, payload } => {
+                    assert_eq!(topic, "amaterasu.stream.report/1");
+                    assert_eq!(payload["kind"], "issue");
+                    published.push(payload);
+                    Response::Ok
+                }
+                _ => panic!("unexpected command"),
+            })
+        };
+        for _ in 0..4 {
+            coordinator.advance_with(&mut send);
+        }
+        coordinator.publish_issues(&mut send);
+        assert!(coordinator.is_idle());
+        assert_eq!(published.len(), 1);
+        let StreamReport::Issue(issue) = serde_json::from_value(published[0].clone()).unwrap()
+        else {
+            panic!("an issue")
+        };
+        assert_eq!(issue.operation, "rtx-source-scope");
+        assert_eq!(issue.layer, LifecycleLayer::RtxHdr);
+        assert_eq!(issue.code, "display_adjustment_unconfirmed");
+        assert_eq!(issue.reason, "display_source_unavailable");
+        assert_eq!(issue.caused_by, Some(LifecycleLayer::DisplaySettings));
+        assert_eq!(issue.disposition, IssueDisposition::CriticalFailure);
+        assert!(
+            issue.site.contains("display_adjustment.rs:"),
+            "{}",
+            issue.site
+        );
     }
 
     #[test]
