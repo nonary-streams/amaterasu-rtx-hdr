@@ -81,10 +81,11 @@ impl Coordinator {
         let operation_id = format!("rtx-source-{}", context.display_scope.id);
         // The consumer that opened the scope bound its ID to the stream; this
         // files the acquire's reports, here and in display settings, there.
-        self.issues.push_binding(amaterasu_module_sdk::stream_lifecycle::StreamBinding::new(
-            context.display_scope.id.clone(),
-            operation_id.clone(),
-        ));
+        self.issues
+            .push_binding(amaterasu_module_sdk::stream_lifecycle::StreamBinding::new(
+                context.display_scope.id.clone(),
+                operation_id.clone(),
+            ));
         let command = Operation::Acquire {
             operation_id: operation_id.clone(),
             scope: context.display_scope.clone(),
@@ -364,7 +365,6 @@ mod tests {
                 }
                 Command::Publish { topic, payload } => {
                     assert_eq!(topic, "amaterasu.stream.report/1");
-                    assert_eq!(payload["kind"], "issue");
                     published.push(payload);
                     Response::Ok
                 }
@@ -376,8 +376,15 @@ mod tests {
         }
         coordinator.publish_issues(&mut send);
         assert!(coordinator.is_idle());
-        assert_eq!(published.len(), 1);
-        let StreamReport::Issue(issue) = serde_json::from_value(published[0].clone()).unwrap()
+        assert_eq!(published.len(), 2);
+        // The acquire's operation is bound to the scope before it is used.
+        let StreamReport::Binding(binding) = serde_json::from_value(published[0].clone()).unwrap()
+        else {
+            panic!("a binding first")
+        };
+        assert_eq!(binding.stream, "scope");
+        assert_eq!(binding.alias, "rtx-source-scope");
+        let StreamReport::Issue(issue) = serde_json::from_value(published[1].clone()).unwrap()
         else {
             panic!("an issue")
         };
