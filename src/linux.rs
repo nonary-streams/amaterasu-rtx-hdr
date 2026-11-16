@@ -340,6 +340,8 @@ pub(crate) struct Processor {
     /// Negotiated resource outputs per configured stream.
     resource_outputs: BTreeMap<u64, resource::ResourceOutput>,
     device_uuid: Option<[u8; 16]>,
+    /// XB30 modifiers this GPU renders, queried once; empty offers CUDA only.
+    dmabuf_modifiers: Option<Vec<u64>>,
     input_offers: input::InputOffers,
     selected_inputs: BTreeMap<u64, input::SelectedInput>,
 }
@@ -357,6 +359,7 @@ impl Processor {
             logger: None,
             resource_outputs: BTreeMap::new(),
             device_uuid: None,
+            dmabuf_modifiers: None,
             input_offers: input::InputOffers::new(),
             selected_inputs: BTreeMap::new(),
         }
@@ -491,6 +494,11 @@ impl Processor {
         self.device_uuid = Some(uuid);
         Ok(uuid)
     }
+    fn dmabuf_modifiers(&mut self) -> &[u64] {
+        self.dmabuf_modifiers
+            .get_or_insert_with(|| resource::dmabuf_modifiers(&self.settings, self.logger.as_ref()))
+            .as_slice()
+    }
 }
 impl Drop for Processor {
     fn drop(&mut self) {
@@ -585,11 +593,12 @@ impl FrameProcessor for Processor {
             return Err(STATUS_INVALID_ARGUMENT);
         }
         let uuid = self.device_uuid()?;
-        let offers = self
-            .resource_outputs
-            .entry(stream)
-            .or_insert_with(|| resource::ResourceOutput::new(uuid));
-        Ok((offers.generation(), vec![offers.offer()]))
+        if !self.resource_outputs.contains_key(&stream) {
+            let output = resource::ResourceOutput::new(uuid, self.dmabuf_modifiers());
+            self.resource_outputs.insert(stream, output);
+        }
+        let offers = &self.resource_outputs[&stream];
+        Ok((offers.generation(), offers.offers()))
     }
     fn select_output(&mut self, stream: u64, generation: u64, offer: u64) -> Result<(), Status> {
         if self.retired.contains(&stream) {

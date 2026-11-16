@@ -144,6 +144,7 @@ void Session::close() {
                 api->free_memory(upload);
             if (kernels)
                 api->unload_module(kernels);
+            close_publisher();
             if (input_resource)
                 cuda_check(api->unregister_image(input_resource), "retire effect input");
             if (effect)
