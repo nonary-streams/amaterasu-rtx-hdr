@@ -192,7 +192,7 @@ mod tests {
             amaterasu_configuration_schema::defaults(&crate::settings_descriptor::definitions())
                 .unwrap();
         settings.insert("rtx_hdr_scope".into(), json!("global"));
-        Context{display_scope:display_settings::Scope{id:"scope".into(),target:display_settings::Target{id:"display".into(),generation:"one".into()}},settings_service:display_settings::SERVICE.into(),lifecycle_target:serde_json::from_value(json!({"kind":"stream","host_epoch":"e","session_id":"s","stream_id":"t","generation":1})).unwrap(),output_format:amaterasu_module_sdk::VideoStreamFormat{codec:amaterasu_module_sdk::VideoCodec::Hevc,bit_depth:10,dynamic_range:amaterasu_module_sdk::DynamicRange::Hdr},settings_revision:"r".into(),settings:json!(settings)}
+        Context{display_scope:display_settings::Scope{id:"scope".into(),target:display_settings::Target{id:"display".into(),generation:"one".into()}},settings_service:display_settings::SERVICE.into(),lifecycle_target:serde_json::from_value(json!({"kind":"stream","host_epoch":"e","session_id":"s","stream_id":"t","generation":1})).unwrap(),output_format:amaterasu_module_sdk::VideoStreamFormat{codec:amaterasu_module_sdk::VideoCodec::Hevc,bit_depth:10,chroma_sampling:Default::default(),dynamic_range:amaterasu_module_sdk::DynamicRange::Hdr},settings_revision:"r".into(),settings:json!(settings)}
     }
     #[test]
     fn sdr_output_does_not_request_a_display_adjustment() {
