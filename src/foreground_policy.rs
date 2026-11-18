@@ -85,6 +85,12 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    const GAMES: [&str; 2] = if cfg!(windows) {
+        ["C:/games/one.exe", "C:/games/two.exe"]
+    } else {
+        ["/games/one", "/games/two"]
+    };
+
     fn target(id: &str) -> LifecycleTarget {
         LifecycleTarget::Stream {
             host_epoch: "epoch".into(),
@@ -103,7 +109,7 @@ mod tests {
     }
     fn snapshot(fullscreen: Option<bool>) -> amaterasu_module_sdk::foreground_context::Snapshot {
         amaterasu_module_sdk::foreground_context::Snapshot {
-            executable: "/games/one".into(),
+            executable: GAMES[0].into(),
             fullscreen,
         }
     }
@@ -122,7 +128,7 @@ mod tests {
         assert!(!policy.enabled(Some(&target("one")), true, true, now));
         policy.set_context(&context(
             "one",
-            json!({"kind":"application", "executable_path":"/games/one"}),
+            json!({"kind":"application", "executable_path":GAMES[0]}),
         ));
         assert!(policy.enabled(Some(&target("one")), true, true, now));
         assert!(!policy.enabled(None, false, true, now + Duration::from_secs(2)));
@@ -133,11 +139,11 @@ mod tests {
         let now = Instant::now();
         policy.set_context(&context(
             "one",
-            json!({"kind":"application", "executable_path":"/games/one"}),
+            json!({"kind":"application", "executable_path":GAMES[0]}),
         ));
         policy.set_context(&context(
             "two",
-            json!({"kind":"application", "executable_path":"/games/two"}),
+            json!({"kind":"application", "executable_path":GAMES[1]}),
         ));
         assert!(!policy.enabled(Some(&target("one")), true, false, now));
         policy.observe(Some(&snapshot(Some(true))), now);
@@ -153,7 +159,7 @@ mod tests {
         assert!(!policy.enabled(Some(&target("one")), true, false, now));
         policy.set_context(&context(
             "one",
-            json!({"kind":"desktop", "executable_path":"/games/one"}),
+            json!({"kind":"desktop", "executable_path":GAMES[0]}),
         ));
         policy.observe(Some(&snapshot(Some(true))), now);
         assert!(!policy.enabled(Some(&target("one")), true, false, now));

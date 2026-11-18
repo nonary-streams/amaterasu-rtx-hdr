@@ -107,13 +107,18 @@ impl Settings {
     }
 }
 
+#[cfg(all(test, windows))]
+const TEST_RUNTIME: &str = "C:/vendor/runtime";
+#[cfg(all(test, not(windows)))]
+const TEST_RUNTIME: &str = "/vendor/runtime";
+
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
     fn settings_use_vendor_defaults_and_reject_invalid_controls() {
         let settings: Settings =
-            serde_json::from_value(serde_json::json!({"runtime_directory":"/runtime"})).unwrap();
+            serde_json::from_value(serde_json::json!({"runtime_directory":TEST_RUNTIME})).unwrap();
         assert_eq!(settings.parameters(), [100, 100, 50, 650, 0]);
         assert!(settings.validate().is_ok());
         for (field, value) in [
@@ -214,7 +219,7 @@ mod stream_settings_tests {
     #[test]
     fn conversion_scope_selects_global_or_application_enablement() {
         let startup: Settings =
-            serde_json::from_value(serde_json::json!({"runtime_directory":"/trusted"})).unwrap();
+            serde_json::from_value(serde_json::json!({"runtime_directory":TEST_RUNTIME})).unwrap();
         let mut values =
             amaterasu_configuration_schema::defaults(&crate::settings_descriptor::definitions())
                 .unwrap();
@@ -234,7 +239,7 @@ mod stream_settings_tests {
     #[test]
     fn stream_controls_cannot_change_trusted_runtime_and_are_bounded() {
         let startup: Settings =
-            serde_json::from_value(serde_json::json!({"runtime_directory":"/trusted"})).unwrap();
+            serde_json::from_value(serde_json::json!({"runtime_directory":TEST_RUNTIME})).unwrap();
         let mut controls: StreamSettings = serde_json::from_value(serde_json::json!({
             "rtx_hdr_enable": true, "rtx_hdr_peak_brightness": 1000,
             "rtx_hdr_middle_gray": 50, "rtx_hdr_contrast": -100,
