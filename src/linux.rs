@@ -175,13 +175,8 @@ fn report_context_priority(
         EGL_CONTEXT_PRIORITY_LOW_IMG => "low",
         _ => "unavailable",
     };
-    let message = serde_json::json!({
-        "event": "rtx_hdr_context",
-        "gpu_priority": priority,
-        "requested_gpu_priority": "high",
-    })
-    .to_string();
-    let _ = logger.emit(amaterasu_module_sdk::LogLevel::Info, "rtx-hdr", &message);
+    let message = format!("Requested high GPU priority. Driver-reported priority: {priority}.");
+    let _ = logger.emit(amaterasu_module_sdk::LogLevel::Debug, "rtx-hdr", &message);
 }
 
 fn backend_failure(
@@ -311,8 +306,8 @@ impl Stream {
         message["event"] = "rtx_hdr_gpu_timing".into();
         message["scope"] = "gl_sampling_and_cuda_pipeline_not_end_to_end".into();
         let _ = logger.emit(
-            amaterasu_module_sdk::LogLevel::Info,
-            "rtx-hdr",
+            amaterasu_module_sdk::LogLevel::Debug,
+            "timing/rtx-hdr",
             &message.to_string(),
         );
     }
@@ -468,17 +463,14 @@ impl Processor {
         };
         if active.reported_enabled != Some(enabled) {
             if let Some(logger) = &self.logger {
-                let message = serde_json::json!({
-                    "event": "rtx_hdr_conversion",
-                    "stream": stream,
-                    "enabled": enabled,
-                    "width": frame.width,
-                    "height": frame.height,
-                    "peak_nits": settings.peak_luminance,
-                    "source": "srgb",
-                    "output": "bt2020_pq",
-                })
-                .to_string();
+                let message = if enabled {
+                    format!(
+                        "Enabled SDR to HDR conversion for stream {stream} at {}×{}, targeting {} nits (BT.2020 PQ).",
+                        frame.width, frame.height, settings.peak_luminance
+                    )
+                } else {
+                    format!("Disabled SDR to HDR conversion for stream {stream}.")
+                };
                 let _ = logger.emit(amaterasu_module_sdk::LogLevel::Info, "rtx-hdr", &message);
             }
             active.reported_enabled = Some(enabled);

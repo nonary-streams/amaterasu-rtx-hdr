@@ -106,10 +106,6 @@ fn report_stream_issue(
     } else {
         return;
     };
-    eprintln!(
-        "RTX HDR stream issue operation={} phase={phase} code={}",
-        issue.operation, issue.code
-    );
     issues.push(issue);
 }
 
@@ -288,6 +284,9 @@ mod tests {
         let mut published = Vec::new();
         issues
             .flush_with(&mut |command| {
+                if matches!(command, Command::Log { .. }) {
+                    return Ok(amaterasu_module_sdk::Response::Ok);
+                }
                 let Command::Publish { topic, payload } = command else {
                     panic!("only stream reports are sent")
                 };

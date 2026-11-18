@@ -128,8 +128,9 @@ effect allocations, surfaces, fds and streams retire with their owners.
 
 The frame-processing SDK negotiates the CUDA output and readiness event with
 the selected consumer. NVENC can convert that output to P010 on an ordered CUDA
-stream. Successful first frames and conversion enable/disable transitions emit
-`rtx_hdr_conversion` with the actual conversion state and output color space.
+stream. Successful first frames and conversion state changes write a short message to
+the host log. Enabling conversion includes the dimensions, target luminance in
+nits, and output color space.
 This establishes host processing, not client HDR presentation.
 
 The processor supplies output HDR10 metadata through the SDK, independently of

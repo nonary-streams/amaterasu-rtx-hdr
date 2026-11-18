@@ -329,6 +329,7 @@ mod tests {
                     finished = true;
                     Response::Ok
                 }
+                Command::Log { .. } => Response::Ok,
                 _ => panic!("unexpected command"),
             })
         };
@@ -368,6 +369,7 @@ mod tests {
                     published.push(payload);
                     Response::Ok
                 }
+                Command::Log { .. } => Response::Ok,
                 _ => panic!("unexpected command"),
             })
         };
@@ -478,6 +480,7 @@ mod tests {
                         completed = true;
                         Response::Ok
                     }
+                    Command::Log { .. } => Response::Ok,
                     _ => panic!("unexpected command"),
                 })
             };
